@@ -1,0 +1,39 @@
+[project]
+name = "back"
+version = "0.1.0"
+description = "FastAPI backend for front project"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sqlalchemy>=2.0.36",
+    "pydantic-settings>=2.6.0",
+    "pyjwt>=2.10.0",
+    "passlib[bcrypt]>=1.7.4",
+    "bcrypt>=4.0.0,<5.0.0",
+    "python-multipart>=0.0.12",
+    "email-validator>=2.2.0",
+    "chromadb>=0.4.24,<0.6",
+    "sentence-transformers>=3.0",
+    "torch>=2.2.0,<2.3",
+    "numpy>=1.26.0,<2.0",
+    "onnxruntime==1.23.2",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "httpx>=0.28.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "httpx>=0.28.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
