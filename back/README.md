@@ -32,6 +32,8 @@ Server runs at `http://localhost:3000` (matches Vite proxy in `front`).
 | POST | `/api/auth/login` | No | Login |
 | GET | `/api/users/me` | Bearer | Current user |
 | POST | `/api/users/change-password` | Bearer | Change password (invalidates old tokens) |
+| POST | `/api/docs/upload` | Bearer | Upload `.md` / `.txt` into `docs/` |
+| POST | `/api/docs/index` | Bearer | Incremental index (`?rebuild=true` for full rebuild) |
 
 ### Response format
 
@@ -71,6 +73,13 @@ OpenAPI docs: `http://localhost:3000/docs`
 ## RAG indexing (Phase 1)
 
 Index local markdown files into SQLite metadata + ChromaDB vectors using `BAAI/bge-large-zh-v1.5`.
+
+Via API (front「知识库」页，需登录):
+
+1. `POST /api/docs/upload` — multipart field `file`，保存到 `docs/`
+2. `POST /api/docs/index` — 执行增量更新；`?rebuild=true` 全量重建
+
+Via CLI:
 
 ```bash
 # Put markdown files under docs/

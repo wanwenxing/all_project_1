@@ -5,6 +5,7 @@ const { Header, Content, Footer } = Layout
 
 const menuItems = [
   { key: '/', label: '首页' },
+  { key: '/knowledge', label: '知识库' },
   { key: '/about', label: '关于' },
 ]
 
