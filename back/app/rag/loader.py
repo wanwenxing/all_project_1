@@ -55,6 +55,45 @@ def _resolve_updated_at(
     return None
 
 
+def parse_document_file(file_path: Path, docs_dir: str | Path) -> ParsedDocument:
+    """解析 docs 目录下的单个文件。"""
+    root = Path(docs_dir).resolve()
+    path = file_path.resolve()
+
+    if not path.is_file():
+        raise FileNotFoundError(f"文件不存在: {path}")
+    if path.suffix.lower() not in SUPPORTED_SUFFIXES:
+        raise ValueError(f"不支持的文件类型: {path.suffix}")
+
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"文件不在文档目录内: {path}") from exc
+
+    raw_text = path.read_text(encoding="utf-8")
+    front_matter, body = _parse_front_matter(raw_text)
+    body, updated_label = _extract_updated_label(body)
+    body = body.strip()
+
+    file_mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    relative_path = path.relative_to(root.parent).as_posix()
+    title = str(front_matter.get("title") or _title_from_path(path))
+
+    return ParsedDocument(
+        source_path=relative_path,
+        title=title,
+        content=body,
+        content_hash=_content_hash(body),
+        updated_at=_resolve_updated_at(front_matter, updated_label, file_mtime),
+        file_mtime=file_mtime,
+        metadata={
+            key: str(value)
+            for key, value in front_matter.items()
+            if key not in {"title", "updated_at", "date"}
+        },
+    )
+
+
 def load_documents(docs_dir: str | Path) -> list[ParsedDocument]:
     root = Path(docs_dir).resolve()
     if not root.exists():
@@ -64,30 +103,6 @@ def load_documents(docs_dir: str | Path) -> list[ParsedDocument]:
     for file_path in sorted(root.rglob("*")):
         if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_SUFFIXES:
             continue
-
-        raw_text = file_path.read_text(encoding="utf-8")
-        front_matter, body = _parse_front_matter(raw_text)
-        body, updated_label = _extract_updated_label(body)
-        body = body.strip()
-
-        file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=UTC)
-        relative_path = file_path.relative_to(root.parent).as_posix()
-        title = str(front_matter.get("title") or _title_from_path(file_path))
-
-        documents.append(
-            ParsedDocument(
-                source_path=relative_path,
-                title=title,
-                content=body,
-                content_hash=_content_hash(body),
-                updated_at=_resolve_updated_at(front_matter, updated_label, file_mtime),
-                file_mtime=file_mtime,
-                metadata={
-                    key: str(value)
-                    for key, value in front_matter.items()
-                    if key not in {"title", "updated_at", "date"}
-                },
-            )
-        )
+        documents.append(parse_document_file(file_path, root))
 
     return documents

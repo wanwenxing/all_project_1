@@ -1,5 +1,5 @@
-from app.rag.indexer import DocumentIndexer
 from app.core.config import settings
+from app.rag.indexer import DocumentIndexer
 
 
 def _auth_headers(client) -> dict[str, str]:
@@ -33,7 +33,13 @@ def test_upload_document_saves_to_docs_dir(client, tmp_path, monkeypatch):
     response = client.post(
         "/api/docs/upload",
         headers=headers,
-        files={"file": ("团建笔记.md", "今天很好玩\n\n更新时间：2026年7月\n".encode("utf-8"), "text/markdown")},
+        files={
+            "file": (
+                "团建笔记.md",
+                "今天很好玩\n\n更新时间：2026年7月\n".encode("utf-8"),
+                "text/markdown",
+            )
+        },
     )
 
     assert response.status_code == 200
@@ -75,3 +81,33 @@ def test_index_documents(client, tmp_path, monkeypatch):
     assert body["code"] == 0
     assert body["data"] == {"indexed": 1, "skipped": 0, "removed": 0, "chunks": 2}
     assert body["message"] == "知识库更新完成"
+
+
+def test_index_single_file_by_path(client, tmp_path, monkeypatch):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "only.md").write_text("单文件内容\n", encoding="utf-8")
+    (docs_dir / "other.md").write_text("不应被扫描\n", encoding="utf-8")
+    monkeypatch.setattr(settings, "rag_docs_dir", str(docs_dir))
+
+    calls: list[str] = []
+
+    def fake_index_file(self, file_path, *, force: bool = False):
+        calls.append(str(file_path))
+        return {"indexed": 1, "skipped": 0, "removed": 0, "chunks": 1}
+
+    monkeypatch.setattr(DocumentIndexer, "index_file", fake_index_file)
+
+    headers = _auth_headers(client)
+    response = client.post(
+        "/api/docs/index",
+        headers=headers,
+        params={"path": "docs/only.md"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == 0
+    assert body["message"] == "单文件知识库更新完成"
+    assert body["data"]["indexed"] == 1
+    assert len(calls) == 1
+    assert calls[0].endswith("only.md")

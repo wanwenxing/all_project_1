@@ -125,3 +125,102 @@ def test_index_skips_unchanged_document(rag_session):
     assert first["indexed"] == 1
     assert second["skipped"] == 1
     assert second["indexed"] == 0
+
+
+def test_index_file_does_not_remove_other_documents(rag_session, tmp_path):
+    docs_dir = tmp_path / "docs"
+    first = docs_dir / "first.md"
+    second = docs_dir / "second.md"
+    first.write_text("第一份文档内容，用于验证不会被误删。\n\n段落二。\n", encoding="utf-8")
+    second.write_text("第二份文档内容，单独索引。\n\n另一段落。\n", encoding="utf-8")
+
+    chroma = ChromaStore()
+    indexer = DocumentIndexer(rag_session, chroma_store=chroma, embedder=FakeEmbedder())
+
+    stats1 = indexer.index_file(first)
+    rag_session.commit()
+    assert stats1["indexed"] == 1
+    first_doc = rag_session.scalar(select(Document).where(Document.source_path == "docs/first.md"))
+    assert first_doc is not None
+    first_chunk_count = first_doc.chunk_count
+    first_chunk_ids = {
+        chunk.id
+        for chunk in rag_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_id == first_doc.id)
+        ).all()
+    }
+    chroma_count_after_first = chroma.count()
+
+    stats2 = indexer.index_file(second)
+    rag_session.commit()
+    assert stats2["indexed"] == 1
+
+    # 其他文件的 SQL 记录应完整保留
+    rag_session.refresh(first_doc)
+    assert first_doc.chunk_count == first_chunk_count
+    remaining = rag_session.scalars(
+        select(DocumentChunk).where(DocumentChunk.document_id == first_doc.id)
+    ).all()
+    assert {chunk.id for chunk in remaining} == first_chunk_ids
+
+    docs = rag_session.scalars(select(Document)).all()
+    assert len(docs) == 2
+    assert chroma.count() == chroma_count_after_first + stats2["chunks"]
+
+
+def test_index_file_replaces_only_same_file_chunks(rag_session, tmp_path):
+    docs_dir = tmp_path / "docs"
+    keep = docs_dir / "keep.md"
+    target = docs_dir / "target.md"
+    keep.write_text("保留文档，不应被改动。\n", encoding="utf-8")
+    target.write_text("目标文档版本一。\n", encoding="utf-8")
+
+    chroma = ChromaStore()
+    indexer = DocumentIndexer(rag_session, chroma_store=chroma, embedder=FakeEmbedder())
+    indexer.index_file(keep)
+    indexer.index_file(target)
+    rag_session.commit()
+
+    keep_doc = rag_session.scalar(select(Document).where(Document.source_path == "docs/keep.md"))
+    target_doc = rag_session.scalar(select(Document).where(Document.source_path == "docs/target.md"))
+    assert keep_doc is not None and target_doc is not None
+    keep_chunk_ids = {
+        chunk.id
+        for chunk in rag_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_id == keep_doc.id)
+        ).all()
+    }
+    old_target_hashes = {
+        chunk.content_hash
+        for chunk in rag_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_id == target_doc.id)
+        ).all()
+    }
+
+    # 同文件内容变更 → 只替换 target 的 chunk
+    target.write_text("目标文档版本二，内容已变化。\n\n新增段落。\n", encoding="utf-8")
+    stats = indexer.index_file(target)
+    rag_session.commit()
+    assert stats["indexed"] == 1
+
+    rag_session.refresh(keep_doc)
+    remaining_keep = {
+        chunk.id
+        for chunk in rag_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_id == keep_doc.id)
+        ).all()
+    }
+    assert remaining_keep == keep_chunk_ids
+
+    new_target_chunks = rag_session.scalars(
+        select(DocumentChunk).where(DocumentChunk.document_id == target_doc.id)
+    ).all()
+    new_target_hashes = {chunk.content_hash for chunk in new_target_chunks}
+    assert new_target_hashes.isdisjoint(old_target_hashes)
+    assert any("版本二" in chunk.content or "新增段落" in chunk.content for chunk in new_target_chunks)
+
+    # 同文件内容不变 → 跳过
+    skipped = indexer.index_file(target)
+    rag_session.commit()
+    assert skipped["skipped"] == 1
+    assert skipped["indexed"] == 0

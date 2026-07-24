@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import text
@@ -7,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.rag.chroma_store import ChromaStore, get_chroma_store
 from app.rag.embedder import BGEEmbedder, get_embedder
-from app.rag.loader import load_documents
+from app.rag.loader import load_documents, parse_document_file
 from app.rag.splitter import split_document
 from app.rag.types import ParsedDocument
 
@@ -46,6 +47,19 @@ class DocumentIndexer:
                 stats["indexed"] += 1
                 stats["chunks"] += chunk_count
 
+        return stats
+
+    def index_file(self, file_path: str | Path, *, force: bool = False) -> dict:
+        """只索引指定单个文件，不扫描整个 docs 目录。"""
+        stats = {"indexed": 0, "skipped": 0, "removed": 0, "chunks": 0}
+        docs_dir = Path(settings.rag_docs_dir).resolve()
+        parsed_doc = parse_document_file(Path(file_path), docs_dir)
+        chunk_count = self._index_document(parsed_doc, force=force)
+        if chunk_count == 0:
+            stats["skipped"] = 1
+        else:
+            stats["indexed"] = 1
+            stats["chunks"] = chunk_count
         return stats
 
     def _reset_all(self, stats: dict) -> None:
@@ -97,6 +111,7 @@ class DocumentIndexer:
         )
 
     def _delete_document_chunks(self, document_id: int) -> None:
+        """只删除该 document 自己的 chunk（SQL + Chroma），不影响其他文件。"""
         rows = self.db.execute(
             text(
                 """
@@ -109,8 +124,12 @@ class DocumentIndexer:
         ).all()
         chroma_ids = [row[0] for row in rows if row[0]]
 
-        self.chroma.delete_by_chroma_ids(chroma_ids)
+        # 以 SQL 中记录的 chroma_id 为准删除，避免 where 过滤误伤其他文档
+        if chroma_ids:
+            self.chroma.delete_by_chroma_ids(chroma_ids)
+        # 兜底清理该 document_id 的残留向量（内部会二次校验 metadata）
         self.chroma.delete_by_document_id(document_id)
+
         self.db.execute(
             text("DELETE FROM document_chunks WHERE document_id = :document_id"),
             {"document_id": document_id},
@@ -267,6 +286,12 @@ class DocumentIndexer:
         )
 
     def _index_document(self, parsed_doc: ParsedDocument, force: bool = False) -> int:
+        """
+        单文档增量规则：
+        - 同文件且 content_hash 相同且已 indexed → 跳过
+        - 同文件内容有差异（或 force）→ 仅删除该文件的 document_chunks + 对应 chroma，再重建
+        - 新文件 → 只新增，不触碰其他文件
+        """
         existing = self._get_document_by_path(parsed_doc.source_path)
         if (
             not force
@@ -285,8 +310,8 @@ class DocumentIndexer:
             self._update_document_pending(document_id, parsed_doc)
             title = parsed_doc.title
             updated_at = parsed_doc.updated_at
-
-        self._delete_document_chunks(document_id)
+            # 仅当已有同文件记录且需要重写时，删除该文件自己的旧 chunk
+            self._delete_document_chunks(document_id)
 
         text_chunks = split_document(parsed_doc)
         if not text_chunks:

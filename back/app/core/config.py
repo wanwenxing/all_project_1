@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     rag_docs_dir: str = "./docs"
     rag_chroma_dir: str = "./data/chroma"
+    rag_model_cache_dir: str = "./data/models"
     rag_collection_name: str = "diary_chunks"
     rag_embedding_model: str = "BAAI/bge-large-zh-v1.5"
     rag_chunk_size: int = 300
