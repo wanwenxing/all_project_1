@@ -163,14 +163,17 @@ def search_knowledge_base(
     for hit in hits:
         meta = hit.get("metadata") or {}
         chunk_index = meta.get("chunk_index")
+        document_id = meta.get("document_id")
+        chunk_id = meta.get("chunk_id")
         normalized_hits.append(
             {
                 "chroma_id": hit["chroma_id"],
                 "content": hit.get("content") or "",
                 "distance": hit.get("distance"),
                 "score": hit.get("score"),
-                "document_id": meta.get("document_id"),
-                "chunk_id": meta.get("chunk_id"),
+                # Chroma 历史数据可能是 int，响应 schema 统一为 str
+                "document_id": None if document_id is None else str(document_id),
+                "chunk_id": None if chunk_id is None else str(chunk_id),
                 "chunk_index": int(chunk_index) if chunk_index is not None else None,
                 "source_path": meta.get("source_path"),
                 "title": meta.get("title"),
