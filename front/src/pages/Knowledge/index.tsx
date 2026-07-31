@@ -1,7 +1,9 @@
 import {
+  askDocs,
   indexDocs,
   searchDocs,
   uploadDoc,
+  type AskSseEvent,
   type IndexStatsData,
   type SearchHit,
   type UploadDocData,
@@ -9,6 +11,7 @@ import {
 import {
   Button,
   Card,
+  Collapse,
   Divider,
   Form,
   Input,
@@ -20,9 +23,31 @@ import {
   message,
 } from 'antd'
 import type { UploadFile } from 'antd/es/upload/interface'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 const { Paragraph, Text } = Typography
+
+type AskFormValues = {
+  query: string
+  top_k?: number
+  source_path?: string
+  title?: string
+  updated_at?: string
+}
+
+type ChatRole = 'user' | 'assistant' | 'system'
+
+type ChatMessage = {
+  id: string
+  role: ChatRole
+  content: string
+  streaming?: boolean
+  hits?: SearchHit[]
+}
+
+function uid(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+}
 
 export default function Knowledge() {
   const [fileList, setFileList] = useState<UploadFile[]>([])
@@ -30,10 +55,36 @@ export default function Knowledge() {
   const [uploading, setUploading] = useState(false)
   const [indexing, setIndexing] = useState(false)
   const [searching, setSearching] = useState(false)
+  const [asking, setAsking] = useState(false)
   const [lastUpload, setLastUpload] = useState<UploadDocData | null>(null)
   const [indexStats, setIndexStats] = useState<IndexStatsData | null>(null)
   const [hits, setHits] = useState<SearchHit[]>([])
   const [searchForm] = Form.useForm()
+  const [askForm] = Form.useForm()
+
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [composer, setComposer] = useState('')
+  const askAbortRef = useRef<AbortController | null>(null)
+  const answerMsgIdRef = useRef<string | null>(null)
+  const chatEndRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [chatMessages, asking])
+
+  const pushMessage = (msg: ChatMessage) => {
+    setChatMessages((prev) => [...prev, msg])
+  }
+
+  const updateMessage = (id: string, patch: Partial<ChatMessage>) => {
+    setChatMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)))
+  }
+
+  const appendToMessage = (id: string, delta: string) => {
+    setChatMessages((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, content: m.content + delta } : m)),
+    )
+  }
 
   const handleUpload = async () => {
     const raw = fileList[0]?.originFileObj
@@ -75,13 +126,7 @@ export default function Knowledge() {
     }
   }
 
-  const handleSearch = async (values: {
-    query: string
-    top_k?: number
-    source_path?: string
-    title?: string
-    updated_at?: string
-  }) => {
+  const handleSearch = async (values: AskFormValues) => {
     setSearching(true)
     try {
       const result = await searchDocs({
@@ -98,6 +143,134 @@ export default function Knowledge() {
     } finally {
       setSearching(false)
     }
+  }
+
+  const handleAskEvent = (event: AskSseEvent) => {
+    switch (event.type) {
+      case 'stage':
+        if (event.status === 'start' && event.stage) {
+          const label =
+            event.stage === 'rewrite'
+              ? '正在优化问题…'
+              : event.stage === 'retrieve'
+                ? '正在检索知识库…'
+                : '正在整理回答…'
+          pushMessage({ id: uid('sys'), role: 'system', content: label })
+          if (event.stage === 'answer' && !answerMsgIdRef.current) {
+            const id = uid('assistant')
+            answerMsgIdRef.current = id
+            pushMessage({ id, role: 'assistant', content: '', streaming: true })
+          }
+        }
+        break
+      case 'rewrite_done':
+        pushMessage({
+          id: uid('sys'),
+          role: 'system',
+          content: event.fallback
+            ? `优化失败，沿用原问题`
+            : `已优化为：${event.optimized_query || ''}`,
+        })
+        break
+      case 'retrieve_done': {
+        const list = event.hits || []
+        pushMessage({
+          id: uid('sys'),
+          role: 'system',
+          content: `检索完成，命中 ${event.total ?? list.length} 条`,
+        })
+        if (list.length > 0) {
+          pushMessage({
+            id: uid('hits'),
+            role: 'assistant',
+            content: '相关知识片段',
+            hits: list,
+          })
+        }
+        break
+      }
+      case 'answer_delta':
+        if (event.delta && answerMsgIdRef.current) {
+          appendToMessage(answerMsgIdRef.current, event.delta)
+        }
+        break
+      case 'answer_done':
+        if (answerMsgIdRef.current) {
+          updateMessage(answerMsgIdRef.current, {
+            content: event.answer || '',
+            streaming: false,
+          })
+        }
+        break
+      case 'error':
+        if (!event.fallback) {
+          pushMessage({
+            id: uid('sys'),
+            role: 'system',
+            content: `出错了${event.stage ? `（${event.stage}）` : ''}：${event.message || '未知错误'}`,
+          })
+        }
+        break
+      case 'done':
+        if (answerMsgIdRef.current) {
+          updateMessage(answerMsgIdRef.current, { streaming: false })
+        }
+        if (event.ok === false) {
+          pushMessage({ id: uid('sys'), role: 'system', content: '本轮未完成' })
+        }
+        break
+      default:
+        break
+    }
+  }
+
+  const sendAsk = async () => {
+    const query = composer.trim()
+    if (!query) {
+      message.warning('请输入问题')
+      return
+    }
+    if (asking) return
+
+    const values = askForm.getFieldsValue() as AskFormValues
+    askAbortRef.current?.abort()
+    const controller = new AbortController()
+    askAbortRef.current = controller
+    answerMsgIdRef.current = null
+
+    setAsking(true)
+    setComposer('')
+    pushMessage({ id: uid('user'), role: 'user', content: query })
+
+    try {
+      await askDocs(
+        {
+          query,
+          top_k: values.top_k ?? 5,
+          source_path: values.source_path?.trim() || undefined,
+          title: values.title?.trim() || undefined,
+          updated_at: values.updated_at?.trim() || undefined,
+        },
+        handleAskEvent,
+        controller.signal,
+      )
+    } catch (error) {
+      if ((error as Error).name === 'AbortError') {
+        pushMessage({ id: uid('sys'), role: 'system', content: '已取消' })
+      } else {
+        const msg = error instanceof Error ? error.message : '智能检索失败'
+        pushMessage({ id: uid('sys'), role: 'system', content: msg })
+        message.error(msg)
+      }
+    } finally {
+      setAsking(false)
+      askAbortRef.current = null
+      answerMsgIdRef.current = null
+    }
+  }
+
+  const handleCancelAsk = () => {
+    askAbortRef.current?.abort()
   }
 
   return (
@@ -241,6 +414,223 @@ export default function Knowledge() {
             </List.Item>
           )}
         />
+      </Card>
+
+      <Card title="LLM 智能检索" styles={{ body: { padding: 0 } }}>
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            height: 560,
+            background: '#ededed',
+          }}
+        >
+          <div style={{ flex: 1, overflow: 'auto', padding: '16px 12px' }}>
+            {chatMessages.length === 0 && (
+              <div style={{ textAlign: 'center', color: '#999', marginTop: 48 }}>
+                像聊天一样提问，我会先优化问题、检索知识库，再回复你
+              </div>
+            )}
+
+            {chatMessages.map((msg) => {
+              if (msg.role === 'system') {
+                return (
+                  <div
+                    key={msg.id}
+                    style={{
+                      textAlign: 'center',
+                      margin: '10px 0',
+                      fontSize: 12,
+                      color: '#888',
+                    }}
+                  >
+                    <span
+                      style={{
+                        display: 'inline-block',
+                        background: 'rgba(0,0,0,0.06)',
+                        padding: '4px 10px',
+                        borderRadius: 4,
+                        maxWidth: '85%',
+                      }}
+                    >
+                      {msg.content}
+                    </span>
+                  </div>
+                )
+              }
+
+              const isUser = msg.role === 'user'
+              return (
+                <div
+                  key={msg.id}
+                  style={{
+                    display: 'flex',
+                    justifyContent: isUser ? 'flex-end' : 'flex-start',
+                    alignItems: 'flex-start',
+                    gap: 8,
+                    marginBottom: 14,
+                  }}
+                >
+                  {!isUser && (
+                    <div
+                      style={{
+                        width: 36,
+                        height: 36,
+                        borderRadius: 4,
+                        background: '#07c160',
+                        color: '#fff',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        flexShrink: 0,
+                        fontSize: 12,
+                      }}
+                    >
+                      AI
+                    </div>
+                  )}
+
+                  <div style={{ maxWidth: '72%' }}>
+                    <div
+                      style={{
+                        background: isUser ? '#95ec69' : '#fff',
+                        color: '#111',
+                        padding: '10px 12px',
+                        borderRadius: 6,
+                        boxShadow: '0 1px 1px rgba(0,0,0,0.06)',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                        lineHeight: 1.55,
+                        position: 'relative',
+                      }}
+                    >
+                      {msg.content || (msg.streaming ? '…' : '')}
+                      {msg.streaming && (
+                        <span style={{ opacity: 0.45, marginLeft: 2 }}>▍</span>
+                      )}
+                    </div>
+
+                    {msg.hits && msg.hits.length > 0 && (
+                      <Collapse
+                        size="small"
+                        style={{ marginTop: 8, background: '#fff' }}
+                        items={[
+                          {
+                            key: 'hits',
+                            label: `查看 ${msg.hits.length} 条检索片段`,
+                            children: (
+                              <List
+                                size="small"
+                                dataSource={msg.hits}
+                                renderItem={(item, index) => (
+                                  <List.Item style={{ padding: '8px 0' }}>
+                                    <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                                      <Text>
+                                        #{index + 1} {item.title || '未命名'}
+                                        {item.score != null
+                                          ? ` · ${item.score.toFixed(3)}`
+                                          : ''}
+                                      </Text>
+                                      <Text type="secondary" style={{ fontSize: 12 }}>
+                                        {item.source_path || '-'}
+                                      </Text>
+                                      <Text style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>
+                                        {item.content}
+                                      </Text>
+                                    </Space>
+                                  </List.Item>
+                                )}
+                              />
+                            ),
+                          },
+                        ]}
+                      />
+                    )}
+                  </div>
+
+                  {isUser && (
+                    <div
+                      style={{
+                        width: 36,
+                        height: 36,
+                        borderRadius: 4,
+                        background: '#4a90d9',
+                        color: '#fff',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        flexShrink: 0,
+                        fontSize: 12,
+                      }}
+                    >
+                      我
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+            <div ref={chatEndRef} />
+          </div>
+
+          <div
+            style={{
+              borderTop: '1px solid #d9d9d9',
+              background: '#f7f7f7',
+              padding: 12,
+            }}
+          >
+            <Collapse
+              ghost
+              size="small"
+              items={[
+                {
+                  key: 'filters',
+                  label: '可选过滤条件',
+                  children: (
+                    <Form form={askForm} layout="inline" initialValues={{ top_k: 5 }}>
+                      <Form.Item name="source_path" label="路径">
+                        <Input placeholder="docs/xxx.md" allowClear style={{ width: 180 }} />
+                      </Form.Item>
+                      <Form.Item name="title" label="标题">
+                        <Input placeholder="标题" allowClear style={{ width: 140 }} />
+                      </Form.Item>
+                      <Form.Item name="updated_at" label="时间">
+                        <Input placeholder="2026年6月" allowClear style={{ width: 120 }} />
+                      </Form.Item>
+                      <Form.Item name="top_k" label="条数">
+                        <InputNumber min={1} max={50} />
+                      </Form.Item>
+                    </Form>
+                  ),
+                },
+              ]}
+            />
+
+            <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'flex-end' }}>
+              <Input.TextArea
+                value={composer}
+                onChange={(e) => setComposer(e.target.value)}
+                placeholder="输入问题，Enter 发送，Shift+Enter 换行"
+                autoSize={{ minRows: 2, maxRows: 4 }}
+                style={{ flex: 1 }}
+                onPressEnter={(e) => {
+                  if (!e.shiftKey) {
+                    e.preventDefault()
+                    void sendAsk()
+                  }
+                }}
+              />
+              <Space direction="vertical">
+                <Button type="primary" loading={asking} onClick={() => void sendAsk()}>
+                  发送
+                </Button>
+                <Button disabled={!asking} onClick={handleCancelAsk}>
+                  取消
+                </Button>
+              </Space>
+            </div>
+          </div>
+        </div>
       </Card>
     </Space>
   )

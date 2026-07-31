@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     rag_chunk_size: int = 300
     rag_chunk_overlap: int = 50
 
+    # DeepSeek / OpenAI-compatible chat API
+    llm_api_key: str = ""
+    llm_base_url: str = "https://api.deepseek.com"
+    llm_model: str = "deepseek-v4-flash"
+    llm_timeout_seconds: float = 60.0
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

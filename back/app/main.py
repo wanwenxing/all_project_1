@@ -12,7 +12,7 @@ from app.core.security import TOKEN_REFRESH_HEADER
 from app.db.base import Base
 from app.db.migrate import run_migrations
 from app.db.session import engine, ensure_data_dir
-from app.models import document, document_chunk, user  # noqa: F401
+from app.models import ask_log, document, document_chunk, user  # noqa: F401
 from app.schemas.common import error
 
 

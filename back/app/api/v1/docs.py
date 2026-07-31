@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
@@ -6,11 +7,13 @@ from app.db.session import get_db
 from app.models.user import User
 from app.schemas.common import ApiResponse, success
 from app.schemas.docs import (
+    AskRequest,
     IndexStatsData,
     SearchRequest,
     SearchResultData,
     UploadDocData,
 )
+from app.services.ask import ask_knowledge_base_stream
 from app.services.docs import index_knowledge_base, save_uploaded_doc, search_knowledge_base
 
 router = APIRouter()
@@ -53,3 +56,34 @@ def search_documents(
         updated_at=payload.updated_at,
     )
     return success(SearchResultData(**data), message="检索完成")
+
+
+@router.post("/ask")
+async def ask_documents(
+    payload: AskRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """SSE：rewrite → retrieve → answer（LangGraph），并写入 ask_logs。"""
+
+    async def event_generator():
+        async for frame in ask_knowledge_base_stream(
+            query=payload.query,
+            top_k=payload.top_k,
+            source_path=payload.source_path,
+            title=payload.title,
+            updated_at=payload.updated_at,
+            user_id=current_user.id,
+            db=db,
+        ):
+            yield frame
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

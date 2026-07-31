@@ -35,6 +35,7 @@ Server runs at `http://localhost:3000` (matches Vite proxy in `front`).
 | POST | `/api/docs/upload` | Bearer | Upload `.md` / `.txt` into `docs/` |
 | POST | `/api/docs/index` | Bearer | Index one file via `?path=docs/xxx.md` (omit `path` to index all; `?rebuild=true` force) |
 | POST | `/api/docs/search` | Bearer | Vector search with optional filters (`source_path` / `title` / `updated_at`) |
+| POST | `/api/docs/ask` | Bearer | SSE：LangGraph 编排 rewrite→retrieve→answer（DeepSeek），并写入 `ask_logs` |
 
 ### Response format
 
@@ -102,6 +103,39 @@ POST /api/docs/search
 ```
 
 `source_path` / `title` / `updated_at` 均为可选精确过滤；前端「知识库」页已提供检索表单。
+
+### Ask (SSE + DeepSeek + LangGraph)
+
+需在 `.env` 配置（参见 [DeepSeek 文档](https://api-docs.deepseek.com/zh-cn/)）：
+
+```bash
+LLM_API_KEY=sk-xxx
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-v4-flash
+LLM_TIMEOUT_SECONDS=60
+```
+
+流程：`rewrite`（优化问题）→ `retrieve`（向量检索）→ `answer`（基于 hits 润色）。编排在 `app/rag/ask_graph.py`。
+
+```bash
+curl -N -X POST http://localhost:3000/api/docs/ask \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"职业迷茫和收支规划","top_k":5}'
+```
+
+SSE 每条 `data:` 为 JSON，核心 `type`：
+
+| type | 含义 |
+|------|------|
+| `stage` | `rewrite` / `retrieve` / `answer`，`status` 为 `start` 或 `done` |
+| `rewrite_delta` / `rewrite_done` | 问题优化增量与最终问句 |
+| `retrieve_done` | 检索 hits |
+| `answer_delta` / `answer_done` | 润色回答增量与全文 |
+| `error` | 失败（含 `stage`；改写失败可 `fallback` 后继续） |
+| `done` | 整次结束（`ok: true/false`） |
+
+每次调用会写入 SQLite 表 `ask_logs`（时间、原问题、优化问题、hits JSON、回答、success/error 等）。
 
 Via CLI:
 
