@@ -131,7 +131,7 @@ export default function Knowledge() {
     try {
       const result = await searchDocs({
         query: values.query.trim(),
-        top_k: values.top_k ?? 5,
+        top_k: values.top_k ?? 2,
         source_path: values.source_path?.trim() || undefined,
         title: values.title?.trim() || undefined,
         updated_at: values.updated_at?.trim() || undefined,
@@ -246,7 +246,7 @@ export default function Knowledge() {
       await askDocs(
         {
           query,
-          top_k: values.top_k ?? 5,
+          top_k: values.top_k ?? 2,
           source_path: values.source_path?.trim() || undefined,
           title: values.title?.trim() || undefined,
           updated_at: values.updated_at?.trim() || undefined,
@@ -347,7 +347,7 @@ export default function Knowledge() {
         <Form
           form={searchForm}
           layout="vertical"
-          initialValues={{ top_k: 5 }}
+          initialValues={{ top_k: 2 }}
           onFinish={handleSearch}
         >
           <Form.Item
@@ -587,7 +587,7 @@ export default function Knowledge() {
                   key: 'filters',
                   label: '可选过滤条件',
                   children: (
-                    <Form form={askForm} layout="inline" initialValues={{ top_k: 5 }}>
+                    <Form form={askForm} layout="inline" initialValues={{ top_k: 2 }}>
                       <Form.Item name="source_path" label="路径">
                         <Input placeholder="docs/xxx.md" allowClear style={{ width: 180 }} />
                       </Form.Item>

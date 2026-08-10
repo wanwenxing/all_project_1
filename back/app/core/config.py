@@ -28,6 +28,16 @@ class Settings(BaseSettings):
     rag_embedding_model: str = "BAAI/bge-large-zh-v1.5"
     rag_chunk_size: int = 300
     rag_chunk_overlap: int = 50
+    # 向量召回最低相关度（仅在未启用 rerank 时作为粗过滤）
+    rag_min_score: float = 0.5
+    # 混合检索 + Rerank
+    rag_hybrid_enabled: bool = True
+    rag_fetch_k: int = 5
+    rag_candidate_k: int = 5
+    rag_rrf_k: int = 60
+    rag_rerank_enabled: bool = True
+    rag_reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    rag_default_top_k: int = 2
 
     # DeepSeek / OpenAI-compatible chat API
     llm_api_key: str = ""

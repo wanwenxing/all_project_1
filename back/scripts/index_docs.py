@@ -38,6 +38,7 @@ def main() -> None:
         "Index finished: "
         f"indexed={stats['indexed']}, "
         f"skipped={stats['skipped']}, "
+        f"metadata_updated={stats['metadata_updated']}, "
         f"removed={stats['removed']}, "
         f"chunks={stats['chunks']}"
     )

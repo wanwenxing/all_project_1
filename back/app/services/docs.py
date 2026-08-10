@@ -4,10 +4,14 @@ from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.db.session import SessionLocal
 from app.rag.chroma_store import get_chroma_store
 from app.rag.embedder import get_embedder
+from app.rag.fts_store import FTSStore
+from app.rag.hybrid import rrf_fuse
 from app.rag.indexer import DocumentIndexer
 from app.rag.loader import SUPPORTED_SUFFIXES
+from app.rag.reranker import get_reranker
 
 
 def get_docs_dir() -> Path:
@@ -135,10 +139,50 @@ def _build_chroma_where(
     return {"$and": clauses}
 
 
+def _normalize_vector_hits(hits: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for rank, hit in enumerate(hits, start=1):
+        meta = hit.get("metadata") or {}
+        chunk_index = meta.get("chunk_index")
+        document_id = meta.get("document_id")
+        chunk_id = meta.get("chunk_id")
+        normalized.append(
+            {
+                "chroma_id": hit["chroma_id"],
+                "content": hit.get("content") or "",
+                "distance": hit.get("distance"),
+                "score": hit.get("score"),
+                "document_id": None if document_id is None else str(document_id),
+                "chunk_id": None if chunk_id is None else str(chunk_id),
+                "chunk_index": int(chunk_index) if chunk_index is not None else None,
+                "source_path": meta.get("source_path"),
+                "title": meta.get("title"),
+                "updated_at": meta.get("updated_at") or None,
+                "vector_rank": rank,
+            }
+        )
+    return normalized
+
+
+def _public_hit(hit: dict) -> dict:
+    return {
+        "chroma_id": hit.get("chroma_id") or "",
+        "content": hit.get("content") or "",
+        "distance": hit.get("distance"),
+        "score": hit.get("score"),
+        "document_id": hit.get("document_id"),
+        "chunk_id": hit.get("chunk_id"),
+        "chunk_index": hit.get("chunk_index"),
+        "source_path": hit.get("source_path"),
+        "title": hit.get("title"),
+        "updated_at": hit.get("updated_at") or None,
+    }
+
+
 def search_knowledge_base(
     *,
     query: str,
-    top_k: int = 5,
+    top_k: int | None = None,
     source_path: str | None = None,
     title: str | None = None,
     updated_at: str | None = None,
@@ -147,42 +191,63 @@ def search_knowledge_base(
     if not text:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="检索关键字不能为空")
 
-    embedding = get_embedder().embed_query(text)
+    final_top_k = settings.rag_default_top_k if top_k is None else top_k
+    fetch_k = max(settings.rag_fetch_k, final_top_k)
+    candidate_k = max(settings.rag_candidate_k, final_top_k)
+
     where = _build_chroma_where(
         source_path=source_path,
         title=title,
         updated_at=updated_at,
     )
-    hits = get_chroma_store().query(
+    embedding = get_embedder().embed_query(text)
+    raw_vector_hits = get_chroma_store().query(
         embedding,
-        n_results=top_k,
+        n_results=fetch_k,
         where=where,
     )
+    vector_hits = _normalize_vector_hits(raw_vector_hits)
 
-    normalized_hits = []
-    for hit in hits:
-        meta = hit.get("metadata") or {}
-        chunk_index = meta.get("chunk_index")
-        document_id = meta.get("document_id")
-        chunk_id = meta.get("chunk_id")
-        normalized_hits.append(
-            {
-                "chroma_id": hit["chroma_id"],
-                "content": hit.get("content") or "",
-                "distance": hit.get("distance"),
-                "score": hit.get("score"),
-                # Chroma 历史数据可能是 int，响应 schema 统一为 str
-                "document_id": None if document_id is None else str(document_id),
-                "chunk_id": None if chunk_id is None else str(chunk_id),
-                "chunk_index": int(chunk_index) if chunk_index is not None else None,
-                "source_path": meta.get("source_path"),
-                "title": meta.get("title"),
-                "updated_at": meta.get("updated_at") or None,
-            }
+    # 未启用 rerank 时，仍可用向量阈值做粗过滤
+    if not settings.rag_rerank_enabled:
+        min_score = settings.rag_min_score
+        vector_hits = [
+            hit
+            for hit in vector_hits
+            if hit.get("score") is None or float(hit["score"]) >= min_score
+        ]
+
+    keyword_hits: list[dict] = []
+    if settings.rag_hybrid_enabled:
+        db = SessionLocal()
+        try:
+            keyword_hits = FTSStore(db).search(
+                text,
+                limit=fetch_k,
+                source_path=source_path,
+                title=title,
+                updated_at=updated_at,
+            )
+        finally:
+            db.close()
+
+    if settings.rag_hybrid_enabled:
+        candidates = rrf_fuse(
+            vector_hits,
+            keyword_hits,
+            k=settings.rag_rrf_k,
+            limit=candidate_k,
         )
+    else:
+        candidates = vector_hits[:candidate_k]
+
+    if settings.rag_rerank_enabled and candidates:
+        hits = get_reranker().rerank(text, candidates, top_k=final_top_k)
+    else:
+        hits = candidates[:final_top_k]
 
     return {
         "query": text,
-        "total": len(normalized_hits),
-        "hits": normalized_hits,
+        "total": len(hits),
+        "hits": [_public_hit(hit) for hit in hits],
     }

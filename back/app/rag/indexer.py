@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -8,9 +8,12 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.rag.chroma_store import ChromaStore, get_chroma_store
 from app.rag.embedder import BGEEmbedder, get_embedder
+from app.rag.fts_store import FTSStore
 from app.rag.loader import load_documents, parse_document_file
 from app.rag.splitter import split_document
 from app.rag.types import ParsedDocument
+
+IndexAction = Literal["skip", "metadata", "reindex"]
 
 
 class DocumentIndexer:
@@ -19,13 +22,22 @@ class DocumentIndexer:
         db: Session,
         chroma_store: ChromaStore | None = None,
         embedder: BGEEmbedder | None = None,
+        fts_store: FTSStore | None = None,
     ) -> None:
         self.db = db
         self.chroma = chroma_store or get_chroma_store()
         self.embedder = embedder or get_embedder()
+        self.fts = fts_store or FTSStore(db)
+        self.fts.ensure_schema()
 
     def index_all(self, docs_dir: str | None = None, rebuild: bool = False) -> dict:
-        stats = {"indexed": 0, "skipped": 0, "removed": 0, "chunks": 0}
+        stats = {
+            "indexed": 0,
+            "skipped": 0,
+            "metadata_updated": 0,
+            "removed": 0,
+            "chunks": 0,
+        }
 
         if rebuild:
             self._reset_all(stats)
@@ -40,27 +52,35 @@ class DocumentIndexer:
                 stats["removed"] += 1
 
         for parsed_doc in parsed_docs:
-            chunk_count = self._index_document(parsed_doc, force=rebuild)
-            if chunk_count == 0:
-                stats["skipped"] += 1
-            else:
-                stats["indexed"] += 1
-                stats["chunks"] += chunk_count
+            action, chunk_count = self._index_document(parsed_doc, force=rebuild)
+            self._accumulate_stats(stats, action, chunk_count)
 
         return stats
 
     def index_file(self, file_path: str | Path, *, force: bool = False) -> dict:
         """只索引指定单个文件，不扫描整个 docs 目录。"""
-        stats = {"indexed": 0, "skipped": 0, "removed": 0, "chunks": 0}
+        stats = {
+            "indexed": 0,
+            "skipped": 0,
+            "metadata_updated": 0,
+            "removed": 0,
+            "chunks": 0,
+        }
         docs_dir = Path(settings.rag_docs_dir).resolve()
         parsed_doc = parse_document_file(Path(file_path), docs_dir)
-        chunk_count = self._index_document(parsed_doc, force=force)
-        if chunk_count == 0:
-            stats["skipped"] = 1
-        else:
-            stats["indexed"] = 1
-            stats["chunks"] = chunk_count
+        action, chunk_count = self._index_document(parsed_doc, force=force)
+        self._accumulate_stats(stats, action, chunk_count)
         return stats
+
+    @staticmethod
+    def _accumulate_stats(stats: dict, action: IndexAction, chunk_count: int) -> None:
+        if action == "skip":
+            stats["skipped"] += 1
+        elif action == "metadata":
+            stats["metadata_updated"] += 1
+        else:
+            stats["indexed"] += 1
+            stats["chunks"] += chunk_count
 
     def _reset_all(self, stats: dict) -> None:
         rows = self.db.execute(text("SELECT id FROM documents")).mappings().all()
@@ -70,6 +90,7 @@ class DocumentIndexer:
 
         self.db.execute(text("DELETE FROM document_chunks"))
         self.db.execute(text("DELETE FROM documents"))
+        self.fts.clear()
         self.chroma.reset()
 
     def _list_document_paths(self) -> list[str]:
@@ -100,6 +121,36 @@ class DocumentIndexer:
         ).mappings().first()
         return dict(row) if row is not None else None
 
+    def _embedding_matches(self, existing: dict[str, Any]) -> bool:
+        return (
+            existing.get("embedding_model") == self.embedder.model_name
+            and existing.get("embedding_dimension") == self.embedder.dimension
+        )
+
+    def _decide_action(
+        self,
+        existing: dict[str, Any] | None,
+        parsed_doc: ParsedDocument,
+        *,
+        force: bool,
+    ) -> IndexAction:
+        if force or existing is None:
+            return "reindex"
+        if existing["index_status"] != "indexed":
+            return "reindex"
+        if existing["content_hash"] != parsed_doc.content_hash:
+            return "reindex"
+        if not self._embedding_matches(existing):
+            return "reindex"
+
+        metadata_changed = (
+            existing.get("title") != parsed_doc.title
+            or (existing.get("updated_at") or None) != (parsed_doc.updated_at or None)
+        )
+        if metadata_changed:
+            return "metadata"
+        return "skip"
+
     def _remove_document_by_path(self, source_path: str) -> None:
         document = self._get_document_by_path(source_path)
         if document is None:
@@ -129,6 +180,7 @@ class DocumentIndexer:
             self.chroma.delete_by_chroma_ids(chroma_ids)
         # 兜底清理该 document_id 的残留向量（内部会二次校验 metadata）
         self.chroma.delete_by_document_id(document_id)
+        self.fts.delete_by_document_id(document_id)
 
         self.db.execute(
             text("DELETE FROM document_chunks WHERE document_id = :document_id"),
@@ -194,6 +246,73 @@ class DocumentIndexer:
                 "file_mtime": parsed_doc.file_mtime,
             },
         )
+
+    def _update_document_metadata_fields(
+        self,
+        document_id: int,
+        parsed_doc: ParsedDocument,
+    ) -> None:
+        self.db.execute(
+            text(
+                """
+                UPDATE documents
+                SET
+                    title = :title,
+                    updated_at = :updated_at,
+                    file_mtime = :file_mtime
+                WHERE id = :id
+                """
+            ),
+            {
+                "id": document_id,
+                "title": parsed_doc.title,
+                "updated_at": parsed_doc.updated_at,
+                "file_mtime": parsed_doc.file_mtime,
+            },
+        )
+
+    def _update_chroma_metadata(
+        self,
+        document_id: int,
+        *,
+        title: str,
+        updated_at: str | None,
+        source_path: str,
+    ) -> None:
+        rows = self.db.execute(
+            text(
+                """
+                SELECT id, chunk_index, chroma_id
+                FROM document_chunks
+                WHERE document_id = :document_id
+                ORDER BY chunk_index
+                """
+            ),
+            {"document_id": document_id},
+        ).mappings().all()
+        chroma_ids = [row["chroma_id"] for row in rows if row["chroma_id"]]
+        if not chroma_ids:
+            return
+
+        existing_metas = self.chroma.get_metadatas(chroma_ids)
+        updated_metas: list[dict] = []
+        for index, row in enumerate(rows):
+            if not row["chroma_id"]:
+                continue
+            meta = dict(existing_metas[index]) if index < len(existing_metas) else {}
+            meta.update(
+                {
+                    "document_id": str(document_id),
+                    "chunk_id": str(row["id"]),
+                    "chunk_index": int(row["chunk_index"]),
+                    "source_path": source_path,
+                    "title": title,
+                    "updated_at": updated_at or "",
+                }
+            )
+            updated_metas.append(meta)
+
+        self.chroma.update_metadatas(chroma_ids, updated_metas)
 
     def _update_document_indexed(
         self,
@@ -285,21 +404,34 @@ class DocumentIndexer:
             {"id": chunk_id, "chroma_id": chroma_id},
         )
 
-    def _index_document(self, parsed_doc: ParsedDocument, force: bool = False) -> int:
+    def _index_document(
+        self,
+        parsed_doc: ParsedDocument,
+        force: bool = False,
+    ) -> tuple[IndexAction, int]:
         """
-        单文档增量规则：
-        - 同文件且 content_hash 相同且已 indexed → 跳过
-        - 同文件内容有差异（或 force）→ 仅删除该文件的 document_chunks + 对应 chroma，再重建
-        - 新文件 → 只新增，不触碰其他文件
+        单文档三分支增量规则：
+        - skip：正文、标题、更新时间、模型都未变
+        - metadata：正文与模型未变，仅标题或更新时间变了 → 只刷 SQL/Chroma 元数据
+        - reindex：新文件 / 正文变了 / 换了模型 / 强制重建
         """
         existing = self._get_document_by_path(parsed_doc.source_path)
-        if (
-            not force
-            and existing is not None
-            and existing["content_hash"] == parsed_doc.content_hash
-            and existing["index_status"] == "indexed"
-        ):
-            return 0
+        action = self._decide_action(existing, parsed_doc, force=force)
+
+        if action == "skip":
+            return "skip", 0
+
+        if action == "metadata":
+            assert existing is not None
+            document_id = int(existing["id"])
+            self._update_document_metadata_fields(document_id, parsed_doc)
+            self._update_chroma_metadata(
+                document_id,
+                title=parsed_doc.title,
+                updated_at=parsed_doc.updated_at,
+                source_path=parsed_doc.source_path,
+            )
+            return "metadata", 0
 
         if existing is None:
             document_id = self._insert_document(parsed_doc)
@@ -321,7 +453,7 @@ class DocumentIndexer:
                 title=title,
                 updated_at=updated_at,
             )
-            return 0
+            return "reindex", 0
 
         db_chunks: list[dict[str, Any]] = []
         for text_chunk in text_chunks:
@@ -335,6 +467,11 @@ class DocumentIndexer:
             )
             chroma_id = f"chunk:{chunk_id}"
             self._update_chunk_chroma_id(chunk_id, chroma_id)
+            self.fts.upsert_chunk(
+                chunk_id=chunk_id,
+                document_id=document_id,
+                content=text_chunk.content,
+            )
             db_chunks.append(
                 {
                     "id": chunk_id,
@@ -370,4 +507,4 @@ class DocumentIndexer:
             title=title,
             updated_at=updated_at,
         )
-        return len(db_chunks)
+        return "reindex", len(db_chunks)

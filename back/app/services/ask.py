@@ -60,7 +60,7 @@ def _persist_ask_log(
 async def ask_knowledge_base_stream(
     *,
     query: str,
-    top_k: int = 5,
+    top_k: int = 2,
     source_path: str | None = None,
     title: str | None = None,
     updated_at: str | None = None,

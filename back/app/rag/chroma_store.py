@@ -58,6 +58,35 @@ class ChromaStore:
         if chroma_ids:
             self._collection.delete(ids=chroma_ids)
 
+    def update_metadatas(self, chroma_ids: list[str], metadatas: list[dict]) -> None:
+        """只更新 metadata，不改动向量与正文。"""
+        if not chroma_ids:
+            return
+        normalized = []
+        for meta in metadatas:
+            item = dict(meta)
+            if "document_id" in item:
+                item["document_id"] = str(item["document_id"])
+            if "chunk_id" in item:
+                item["chunk_id"] = str(item["chunk_id"])
+            if "chunk_index" in item:
+                item["chunk_index"] = int(item["chunk_index"])
+            normalized.append(item)
+        self._collection.update(ids=chroma_ids, metadatas=normalized)
+
+    def get_metadatas(self, chroma_ids: list[str]) -> list[dict]:
+        if not chroma_ids:
+            return []
+        result = self._collection.get(ids=chroma_ids, include=["metadatas"])
+        ids = result.get("ids") or []
+        metadatas = result.get("metadatas") or []
+        by_id = {
+            chroma_id: (metadatas[index] or {})
+            for index, chroma_id in enumerate(ids)
+            if index < len(metadatas)
+        }
+        return [by_id.get(chroma_id, {}) for chroma_id in chroma_ids]
+
     def upsert(
         self,
         chroma_ids: list[str],

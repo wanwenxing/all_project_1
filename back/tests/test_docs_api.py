@@ -70,7 +70,7 @@ def test_index_documents(client, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "rag_docs_dir", str(docs_dir))
 
     def fake_index_all(self, docs_dir=None, rebuild: bool = False):
-        return {"indexed": 1, "skipped": 0, "removed": 0, "chunks": 2}
+        return {"indexed": 1, "skipped": 0, "metadata_updated": 0, "removed": 0, "chunks": 2}
 
     monkeypatch.setattr(DocumentIndexer, "index_all", fake_index_all)
 
@@ -79,7 +79,13 @@ def test_index_documents(client, tmp_path, monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["code"] == 0
-    assert body["data"] == {"indexed": 1, "skipped": 0, "removed": 0, "chunks": 2}
+    assert body["data"] == {
+        "indexed": 1,
+        "skipped": 0,
+        "metadata_updated": 0,
+        "removed": 0,
+        "chunks": 2,
+    }
     assert body["message"] == "知识库更新完成"
 
 

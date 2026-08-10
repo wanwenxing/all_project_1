@@ -83,6 +83,104 @@ def test_split_document_creates_multiple_chunks_for_long_text(rag_session, tmp_p
     assert len(chunks) >= 2
 
 
+def test_split_long_text_prefers_punctuation(monkeypatch):
+    from app.rag.splitter import _split_long_text
+
+    monkeypatch.setattr(settings, "rag_chunk_size", 40)
+    monkeypatch.setattr(settings, "rag_chunk_overlap", 5)
+    text = (
+        "今天去了烤肉店，和同事聊了很多关于工作的想法。"
+        "听了前辈讲职业迷茫和收支规划，觉得世界就是变化的。"
+        "人与人之间的交往本质都是等价互换，不必惧怕变化。"
+    )
+    pieces = _split_long_text(text, chunk_size=40, overlap=5)
+    assert len(pieces) >= 2
+    # 非最后一块应尽量落在句号等标点后
+    for piece in pieces[:-1]:
+        assert piece[-1] in "。！？；.!?;"
+
+
+def test_index_updates_metadata_without_reembed(rag_session, tmp_path):
+    docs_dir = tmp_path / "docs"
+    sample = docs_dir / "sample.md"
+    sample.write_text(
+        "---\ntitle: 旧标题\n---\n"
+        "正文内容保持不变，只改标题和更新时间。\n\n"
+        "更新时间：2026年6月\n",
+        encoding="utf-8",
+    )
+
+    chroma = ChromaStore()
+    indexer = DocumentIndexer(rag_session, chroma_store=chroma, embedder=FakeEmbedder())
+    first = indexer.index_file(sample)
+    rag_session.commit()
+    assert first["indexed"] == 1
+
+    document = rag_session.scalar(select(Document))
+    assert document is not None
+    old_chunk_ids = {
+        chunk.id
+        for chunk in rag_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_id == document.id)
+        ).all()
+    }
+    old_chroma_count = chroma.count()
+
+    sample.write_text(
+        "---\ntitle: 新标题\n---\n"
+        "正文内容保持不变，只改标题和更新时间。\n\n"
+        "更新时间：2026年7月\n",
+        encoding="utf-8",
+    )
+    second = indexer.index_file(sample)
+    rag_session.commit()
+
+    assert second["metadata_updated"] == 1
+    assert second["indexed"] == 0
+    assert second["skipped"] == 0
+
+    rag_session.refresh(document)
+    assert document.title == "新标题"
+    assert document.updated_at == "2026年7月"
+    remaining = {
+        chunk.id
+        for chunk in rag_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_id == document.id)
+        ).all()
+    }
+    assert remaining == old_chunk_ids
+    assert chroma.count() == old_chroma_count
+
+    metas = chroma.get_metadatas([f"chunk:{cid}" for cid in sorted(old_chunk_ids)])
+    assert all(meta.get("title") == "新标题" for meta in metas)
+    assert all(meta.get("updated_at") == "2026年7月" for meta in metas)
+
+
+def test_index_reembeds_when_model_changes(rag_session):
+    class OtherEmbedder(FakeEmbedder):
+        model_name = "other-bge"
+        dimension = 1024
+
+    chroma = ChromaStore()
+    indexer = DocumentIndexer(rag_session, chroma_store=chroma, embedder=FakeEmbedder())
+    first = indexer.index_all()
+    rag_session.commit()
+    assert first["indexed"] == 1
+
+    document = rag_session.scalar(select(Document))
+    assert document is not None
+    assert document.embedding_model == "fake-bge"
+
+    reindexer = DocumentIndexer(rag_session, chroma_store=chroma, embedder=OtherEmbedder())
+    second = reindexer.index_all()
+    rag_session.commit()
+
+    assert second["indexed"] == 1
+    assert second["skipped"] == 0
+    rag_session.refresh(document)
+    assert document.embedding_model == "other-bge"
+
+
 def test_index_writes_sql_and_chroma(rag_session):
     indexer = DocumentIndexer(
         rag_session,

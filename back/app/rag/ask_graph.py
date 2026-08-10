@@ -82,7 +82,7 @@ def build_ask_graph(llm: DeepSeekChatClient):
             search_result = await anyio.to_thread.run_sync(
                 lambda: search_knowledge_base(
                     query=optimized,
-                    top_k=int(state.get("top_k") or 5),
+                    top_k=int(state.get("top_k") or 2),
                     source_path=state.get("source_path"),
                     title=state.get("title"),
                     updated_at=state.get("updated_at"),
