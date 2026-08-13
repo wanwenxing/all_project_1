@@ -194,6 +194,76 @@ def test_llm_not_configured_raises():
         pass
 
 
+async def _fake_answer_timeout(_llm, *, original_query, optimized_query, hits, cancel=None):
+    from app.llm import LLMTimeoutError
+
+    raise LLMTimeoutError("模型响应超时（>60s），请稍后重试")
+    yield  # pragma: no cover — 使该函数仍是 async generator
+
+
+def test_ask_answer_timeout_returns_sse_error(client, monkeypatch):
+    monkeypatch.setattr(settings, "llm_api_key", "fake-key")
+    fake = FakeLLM()
+    monkeypatch.setattr("app.services.ask.get_llm_client", lambda: fake)
+    monkeypatch.setattr("app.rag.ask_graph.rewrite_query_stream", _fake_rewrite)
+    monkeypatch.setattr("app.rag.ask_graph.answer_from_hits_stream", _fake_answer_timeout)
+    monkeypatch.setattr(
+        "app.rag.ask_graph.search_vector_hits",
+        lambda **kwargs: [
+            {
+                "chroma_id": "chunk:1",
+                "content": "测试内容",
+                "distance": 0.1,
+                "score": 0.9,
+                "document_id": "1",
+                "chunk_id": "1",
+                "chunk_index": 0,
+                "source_path": "docs/t.md",
+                "title": "t",
+                "updated_at": None,
+            }
+        ],
+    )
+    monkeypatch.setattr("app.rag.ask_graph.search_keyword_hits", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "app.rag.ask_graph.fuse_hits",
+        lambda vector_hits, keyword_hits, **kwargs: vector_hits[: kwargs.get("candidate_k", 5)],
+    )
+    monkeypatch.setattr(
+        "app.rag.ask_graph.rerank_hits",
+        lambda **kwargs: (kwargs.get("candidates") or [])[: kwargs.get("top_k", 2)],
+    )
+
+    headers = _auth_headers(client)
+    with client.stream(
+        "POST",
+        "/api/docs/ask",
+        headers=headers,
+        json={"query": "超时测试"},
+    ) as response:
+        assert response.status_code == 200
+        body = "".join(response.iter_text())
+
+    events = _parse_sse(body)
+    error_events = [e for e in events if e["type"] == "error" and e.get("stage") == "answer"]
+    assert error_events
+    assert error_events[0].get("code") == "llm_timeout"
+    assert "超时" in error_events[0].get("message", "")
+    assert events[-1]["type"] == "done"
+    assert events[-1]["ok"] is False
+    assert events[-1].get("code") == "llm_timeout"
+
+    db = db_session.SessionLocal()
+    try:
+        row = db.execute(select(AskLog).order_by(AskLog.id.desc())).scalars().first()
+        assert row is not None
+        assert row.status == "error"
+        assert row.error_stage == "answer"
+        assert row.error_message and "超时" in row.error_message
+    finally:
+        db.close()
+
+
 def test_ask_cancelled_stops_llm_and_logs(client, monkeypatch):
     monkeypatch.setattr(settings, "llm_api_key", "fake-key")
     fake = FakeLLM()
@@ -228,5 +298,49 @@ def test_ask_cancelled_stops_llm_and_logs(client, monkeypatch):
         assert row is not None
         assert row.status == "cancelled"
         assert row.original_query == "中途取消测试"
+    finally:
+        db.close()
+
+
+def test_ask_unexpected_exception_emits_error_and_done(client, monkeypatch):
+    """图外层意外崩溃时，仍应尽量发出 SSE error + done。"""
+    monkeypatch.setattr(settings, "llm_api_key", "fake-key")
+    fake = FakeLLM()
+    monkeypatch.setattr("app.services.ask.get_llm_client", lambda: fake)
+
+    class BoomGraph:
+        async def astream(self, *_args, **_kwargs):
+            raise RuntimeError("simulated hard failure")
+            yield  # pragma: no cover — keep async generator shape
+
+    monkeypatch.setattr("app.services.ask.build_ask_graph", lambda *_a, **_k: BoomGraph())
+
+    headers = _auth_headers(client)
+    with client.stream(
+        "POST",
+        "/api/docs/ask",
+        headers=headers,
+        json={"query": "意外中断测试"},
+    ) as response:
+        assert response.status_code == 200
+        body = "".join(response.iter_text())
+
+    events = _parse_sse(body)
+    assert events
+    assert events[-1]["type"] == "done"
+    assert events[-1]["ok"] is False
+    assert events[-1].get("code") == "unexpected"
+    error_events = [e for e in events if e["type"] == "error"]
+    assert error_events
+    assert "simulated hard failure" in error_events[0].get("message", "")
+    assert error_events[0].get("code") == "unexpected"
+
+    db = db_session.SessionLocal()
+    try:
+        row = db.execute(select(AskLog).order_by(AskLog.id.desc())).scalars().first()
+        assert row is not None
+        assert row.status == "error"
+        assert row.error_stage == "stream"
+        assert row.error_message and "simulated hard failure" in row.error_message
     finally:
         db.close()

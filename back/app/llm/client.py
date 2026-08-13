@@ -3,14 +3,11 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import APITimeoutError, AsyncOpenAI
 
 from app.core.ask_cancel import AskCancelled, AskCancelToken
+from app.core.ask_errors import LLMNotConfiguredError, LLMTimeoutError
 from app.core.config import settings
-
-
-class LLMNotConfiguredError(RuntimeError):
-    """Raised when LLM_API_KEY is missing."""
 
 
 async def _aclose_stream(stream: Any) -> None:
@@ -65,7 +62,7 @@ class DeepSeekChatClient:
     ) -> AsyncIterator[str]:
         """通用流式 chat.completions；默认关闭思考模式，仅产出正文 content。
 
-        若传入 cancel，用户中途取消时会关掉上游 LLM 流并抛出 AskCancelled。
+        取消 → AskCancelled；超时 → LLMTimeoutError；其它异常原样上抛。
         """
         if cancel is not None:
             cancel.throw_if_cancelled()
@@ -90,6 +87,7 @@ class DeepSeekChatClient:
                         extra_body={"thinking": {"type": "disabled"}},
                     )
                 except TypeError:
+                    # 旧版 SDK 不支持 extra_body 时退回普通调用
                     stream = await client.chat.completions.create(**kwargs)
             else:
                 stream = await client.chat.completions.create(**kwargs)
@@ -105,6 +103,10 @@ class DeepSeekChatClient:
                     yield content
         except AskCancelled:
             raise
+        except APITimeoutError as exc:
+            raise LLMTimeoutError(
+                f"模型响应超时（>{self.timeout:.0f}s），请稍后重试"
+            ) from exc
         finally:
             if stream is not None:
                 await _aclose_stream(stream)

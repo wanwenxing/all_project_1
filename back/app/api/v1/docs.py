@@ -1,11 +1,14 @@
 import asyncio
+import json
 from contextlib import suppress
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.ask_cancel import AskCancelToken
+from app.core.ask_errors import build_done_event, build_error_event, classify_ask_exception
 from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.user import User
@@ -21,6 +24,10 @@ from app.services.ask import ask_knowledge_base_stream
 from app.services.docs import index_knowledge_base, save_uploaded_doc, search_knowledge_base
 
 router = APIRouter()
+
+
+def _sse(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 @router.post("/upload", response_model=ApiResponse[UploadDocData])
@@ -92,20 +99,29 @@ async def ask_documents(
         cancel = AskCancelToken()
         watcher = asyncio.create_task(_watch_disconnect(request, cancel))
         try:
-            async for frame in ask_knowledge_base_stream(
-                query=payload.query,
-                top_k=payload.top_k,
-                source_path=payload.source_path,
-                title=payload.title,
-                updated_at=payload.updated_at,
-                user_id=current_user.id,
-                db=db,
-                cancel=cancel,
-            ):
-                yield frame
-                # 已取消则不再继续读（收尾帧已在上方 yield）
-                if cancel.is_cancelled:
-                    break
+            try:
+                async for frame in ask_knowledge_base_stream(
+                    query=payload.query,
+                    top_k=payload.top_k,
+                    source_path=payload.source_path,
+                    title=payload.title,
+                    updated_at=payload.updated_at,
+                    user_id=current_user.id,
+                    db=db,
+                    cancel=cancel,
+                ):
+                    yield frame
+                    # 已取消则不再继续读（收尾帧已在上方 yield）
+                    if cancel.is_cancelled:
+                        break
+            except Exception as exc:  # noqa: BLE001
+                # 编排层之外的意外中断：仍尽量给前端 SSE 收尾
+                failure = classify_ask_exception(exc, cancel=cancel)
+                if failure.is_cancelled:
+                    yield _sse(build_done_event(failure, ok=False))
+                else:
+                    yield _sse(build_error_event("stream", failure))
+                    yield _sse(build_done_event(failure, ok=False))
         finally:
             cancel.cancel()
             watcher.cancel()

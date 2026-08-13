@@ -153,7 +153,12 @@ export default function AskChatWidget() {
         }
         break
       case 'error':
-        if (!event.fallback) {
+        // fallback 的改写失败默认不打扰；超时 / 断连仍提示用户
+        if (
+          !event.fallback ||
+          event.code === 'llm_timeout' ||
+          event.code === 'stream_interrupted'
+        ) {
           pushMessage({
             id: uid('sys'),
             role: 'system',
@@ -166,6 +171,10 @@ export default function AskChatWidget() {
           updateMessage(answerMsgIdRef.current, { streaming: false })
         }
         if (event.ok === false) {
+          if (event.code === 'llm_timeout' || event.code === 'stream_interrupted') {
+            // error 帧已提示，这里只收尾
+            break
+          }
           pushMessage({ id: uid('sys'), role: 'system', content: '本轮未完成' })
         }
         break

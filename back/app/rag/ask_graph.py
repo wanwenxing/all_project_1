@@ -7,6 +7,11 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
 from app.core.ask_cancel import AskCancelled, AskCancelToken
+from app.core.ask_errors import (
+    build_done_event,
+    build_error_event,
+    classify_ask_exception,
+)
 from app.core.config import settings
 from app.llm import DeepSeekChatClient
 from app.llm.ask_llm import answer_from_hits_stream, rewrite_query_stream
@@ -68,14 +73,21 @@ def build_ask_graph(
         except AskCancelled:
             raise
         except Exception as exc:  # noqa: BLE001
+            failure = classify_ask_exception(exc, cancel=cancel)
+            if failure.is_cancelled:
+                raise AskCancelled(failure.message) from exc
             rewrite_fallback = True
+            if failure.kind == "timeout":
+                msg = f"问题优化超时，将使用原问题继续：{failure.message}"
+            else:
+                msg = f"问题优化失败，将使用原问题继续：{failure.message}"
             writer(
-                {
-                    "type": "error",
-                    "stage": "rewrite",
-                    "message": f"问题优化失败，将使用原问题继续：{exc}",
-                    "fallback": True,
-                }
+                build_error_event(
+                    "rewrite",
+                    failure,
+                    fallback=True,
+                    message=msg,
+                )
             )
 
         _check_cancel()
@@ -205,14 +217,16 @@ def build_ask_graph(
         except AskCancelled:
             raise
         except Exception as exc:  # noqa: BLE001
-            message = str(exc)
-            writer({"type": "error", "stage": "retrieve", "message": message})
+            failure = classify_ask_exception(exc, cancel=cancel)
+            if failure.is_cancelled:
+                raise AskCancelled(failure.message) from exc
+            writer(build_error_event("retrieve", failure))
             return {
                 "hits": [],
                 "total": 0,
                 "ok": False,
                 "error_stage": "retrieve",
-                "error_message": message,
+                "error_message": failure.message,
             }
 
         _check_cancel()
@@ -256,14 +270,16 @@ def build_ask_graph(
         except AskCancelled:
             raise
         except Exception as exc:  # noqa: BLE001
-            message = str(exc)
-            writer({"type": "error", "stage": "answer", "message": message})
-            writer({"type": "done", "ok": False})
+            failure = classify_ask_exception(exc, cancel=cancel)
+            if failure.is_cancelled:
+                raise AskCancelled(failure.message) from exc
+            writer(build_error_event("answer", failure))
+            writer(build_done_event(failure, ok=False))
             return {
                 "answer": "".join(answer_parts),
                 "ok": False,
                 "error_stage": "answer",
-                "error_message": message,
+                "error_message": failure.message,
             }
 
         answer = "".join(answer_parts)
@@ -288,7 +304,7 @@ def build_ask_graph(
     async def finish_error_node(state: AskState) -> dict[str, Any]:
         # retrieve 失败时已在 retrieve_node 写过 error；此处补 done
         writer = get_stream_writer()
-        writer({"type": "done", "ok": False})
+        writer(build_done_event(ok=False))
         return {"ok": False}
 
     graph = StateGraph(AskState)

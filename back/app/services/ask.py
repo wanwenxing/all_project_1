@@ -8,8 +8,14 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.ask_cancel import AskCancelled, AskCancelToken
-from app.core.config import settings
-from app.llm import DeepSeekChatClient, LLMNotConfiguredError, get_llm_client
+from app.core.ask_errors import (
+    AskFailure,
+    LLMNotConfiguredError,
+    build_done_event,
+    build_error_event,
+    classify_ask_exception,
+)
+from app.llm import DeepSeekChatClient, get_llm_client
 from app.models.ask_log import AskLog
 from app.rag.ask_graph import AskState, build_ask_graph
 
@@ -78,8 +84,9 @@ async def ask_knowledge_base_stream(
     try:
         client.ensure_configured()
     except LLMNotConfiguredError as exc:
-        yield _sse({"type": "error", "stage": "config", "message": str(exc)})
-        yield _sse({"type": "done", "ok": False})
+        failure = classify_ask_exception(exc)
+        yield _sse(build_error_event("config", failure))
+        yield _sse(build_done_event(failure, ok=False))
         _persist_ask_log(
             db,
             user_id=user_id,
@@ -88,16 +95,17 @@ async def ask_knowledge_base_stream(
             rewrite_fallback=False,
             hits=[],
             answer=None,
-            status="error",
+            status=failure.log_status,
             error_stage="config",
-            error_message=str(exc),
+            error_message=failure.message,
             duration_ms=int((time.perf_counter() - started) * 1000),
             model=client.model,
         )
         return
 
     if cancel is not None and cancel.is_cancelled:
-        yield _sse({"type": "done", "ok": False, "cancelled": True})
+        failure = classify_ask_exception(AskCancelled(), cancel=cancel)
+        yield _sse(build_done_event(failure, ok=False))
         _persist_ask_log(
             db,
             user_id=user_id,
@@ -106,7 +114,7 @@ async def ask_knowledge_base_stream(
             rewrite_fallback=False,
             hits=[],
             answer=None,
-            status="cancelled",
+            status=failure.log_status,
             error_stage=None,
             error_message="cancelled before start",
             duration_ms=int((time.perf_counter() - started) * 1000),
@@ -142,6 +150,7 @@ async def ask_knowledge_base_stream(
     error_stage: str | None = None
     error_message: str | None = None
     terminal_events: list[dict[str, Any]] = []
+    saw_done = False
 
     try:
         async for mode, chunk in graph.astream(
@@ -169,8 +178,10 @@ async def ask_knowledge_base_stream(
                         status = "success"
                         error_stage = None
                         error_message = None
-                elif event_type == "done" and chunk.get("ok") is False:
-                    status = "error"
+                elif event_type == "done":
+                    saw_done = True
+                    if chunk.get("ok") is False:
+                        status = "error"
 
                 yield _sse(chunk)
 
@@ -187,26 +198,21 @@ async def ask_knowledge_base_stream(
                     status = "error"
                     error_stage = chunk.get("error_stage") or error_stage
                     error_message = chunk.get("error_message") or error_message
-    except AskCancelled:
-        status = "cancelled"
-        error_stage = None
-        error_message = "cancelled by client"
-        terminal_events.append({"type": "done", "ok": False, "cancelled": True})
     except Exception as exc:  # noqa: BLE001
-        # 部分底层会把取消包成其它异常；token 已置位则仍记 cancelled
-        if cancel is not None and cancel.is_cancelled:
-            status = "cancelled"
+        # 图内未包住的异常：尽量补 error + done，让前端有明确收尾
+        failure = classify_ask_exception(exc, cancel=cancel)
+        status = failure.log_status
+        if failure.is_cancelled:
             error_stage = None
             error_message = "cancelled by client"
-            terminal_events.append({"type": "done", "ok": False, "cancelled": True})
+            if not saw_done:
+                terminal_events.append(build_done_event(failure, ok=False))
         else:
-            status = "error"
-            error_stage = error_stage or "answer"
-            error_message = str(exc)
-            terminal_events.append(
-                {"type": "error", "stage": error_stage, "message": error_message}
-            )
-            terminal_events.append({"type": "done", "ok": False})
+            error_stage = error_stage or "stream"
+            error_message = failure.message
+            if not saw_done:
+                terminal_events.append(build_error_event(error_stage, failure))
+                terminal_events.append(build_done_event(failure, ok=False))
     finally:
         # 必须在继续 yield 前写库：消费者断开时后续 yield 可能触发 GeneratorExit
         _persist_ask_log(
@@ -223,6 +229,21 @@ async def ask_knowledge_base_stream(
             duration_ms=int((time.perf_counter() - started) * 1000),
             model=client.model,
         )
+
+    # 图正常跑完却漏了 done：补一帧，避免前端只能靠断连兜底
+    if not saw_done and not terminal_events:
+        if status == "error":
+            failure = AskFailure(
+                kind="error",
+                code="unexpected",
+                message=error_message or "回答未正常结束",
+            )
+            terminal_events.append(
+                build_error_event(error_stage or "stream", failure)
+            )
+            terminal_events.append(build_done_event(failure, ok=False))
+        else:
+            terminal_events.append({"type": "done", "ok": True})
 
     for event in terminal_events:
         yield _sse(event)
