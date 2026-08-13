@@ -149,6 +149,7 @@ export default function AskChatWidget() {
           updateMessage(answerMsgIdRef.current, {
             content: event.answer || '',
             streaming: false,
+            hits: event.hits || event.sources || undefined,
           })
         }
         break
@@ -325,7 +326,11 @@ export default function AskChatWidget() {
                         items={[
                           {
                             key: 'hits',
-                            label: `${msg.retrieveStep ? `${RETRIEVE_STEP_LABELS[msg.retrieveStep] || msg.retrieveStep} · ` : ''}查看 ${msg.hits.length} 条片段`,
+                            label: `${
+                              msg.retrieveStep
+                                ? `${RETRIEVE_STEP_LABELS[msg.retrieveStep] || msg.retrieveStep} · `
+                                : '回答依据 · '
+                            }查看 ${msg.hits.length} 条片段`,
                             children: (
                               <List
                                 size="small"

@@ -134,6 +134,10 @@ def test_ask_sse_event_order_and_log(client, monkeypatch):
 
     answer_done = next(e for e in events if e["type"] == "answer_done")
     assert "命中1条" in answer_done["answer"]
+    assert "【依据材料】" in answer_done["answer"]
+    assert answer_done.get("sources")
+    assert answer_done["sources"][0]["title"] == "友情"
+    assert answer_done.get("hits")
 
     db = db_session.SessionLocal()
     try:

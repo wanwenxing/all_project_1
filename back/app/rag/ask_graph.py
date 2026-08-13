@@ -14,7 +14,12 @@ from app.core.ask_errors import (
 )
 from app.core.config import settings
 from app.llm import DeepSeekChatClient
-from app.llm.ask_llm import answer_from_hits_stream, rewrite_query_stream
+from app.llm.ask_llm import (
+    answer_from_hits_stream,
+    ensure_answer_with_evidence,
+    public_sources,
+    rewrite_query_stream,
+)
 from app.services.docs import (
     _public_hits,
     fuse_hits,
@@ -282,8 +287,24 @@ def build_ask_graph(
                 "error_message": failure.message,
             }
 
-        answer = "".join(answer_parts)
-        writer({"type": "answer_done", "answer": answer})
+        raw_answer = "".join(answer_parts)
+        answer = ensure_answer_with_evidence(raw_answer, hits)
+        # 仅在「原文是最终文本前缀」时补推后缀（通常是漏写的依据块）
+        # 若整段被重排（补了【回答】标题），交给 answer_done 整段覆盖，避免重复 delta
+        if answer.startswith(raw_answer):
+            suffix = answer[len(raw_answer) :]
+            if suffix:
+                writer({"type": "answer_delta", "delta": suffix})
+
+        sources = public_sources(hits)
+        writer(
+            {
+                "type": "answer_done",
+                "answer": answer,
+                "hits": hits,
+                "sources": sources,
+            }
+        )
         writer({"type": "stage", "stage": "answer", "status": "done"})
         writer(
             {
@@ -292,6 +313,7 @@ def build_ask_graph(
                 "original_query": original,
                 "optimized_query": optimized,
                 "total": len(hits),
+                "sources": sources,
             }
         )
         return {"answer": answer, "ok": True}
