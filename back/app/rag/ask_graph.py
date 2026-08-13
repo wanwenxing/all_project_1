@@ -6,9 +6,10 @@ import anyio
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
+from app.core.ask_cancel import AskCancelled, AskCancelToken
+from app.core.config import settings
 from app.llm import DeepSeekChatClient
 from app.llm.ask_llm import answer_from_hits_stream, rewrite_query_stream
-from app.core.config import settings
 from app.services.docs import (
     _public_hits,
     fuse_hits,
@@ -37,24 +38,35 @@ class AskState(TypedDict, total=False):
     retrieve_round: int
 
 
-def build_ask_graph(llm: DeepSeekChatClient):
+def build_ask_graph(
+    llm: DeepSeekChatClient,
+    *,
+    cancel: AskCancelToken | None = None,
+):
     """线性图：rewrite → retrieve → answer。"""
+
+    def _check_cancel() -> None:
+        if cancel is not None:
+            cancel.throw_if_cancelled()
 
     async def rewrite_node(state: AskState) -> dict[str, Any]:
         writer = get_stream_writer()
         original = (state.get("original_query") or "").strip()
         writer({"type": "stage", "stage": "rewrite", "status": "start"})
+        _check_cancel()
 
         optimized = original
         rewrite_fallback = False
         try:
             chunks: list[str] = []
-            async for delta in rewrite_query_stream(llm, original):
+            async for delta in rewrite_query_stream(llm, original, cancel=cancel):
                 chunks.append(delta)
                 writer({"type": "rewrite_delta", "delta": delta})
             rewritten = "".join(chunks).strip()
             if rewritten:
                 optimized = rewritten
+        except AskCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001
             rewrite_fallback = True
             writer(
@@ -66,6 +78,7 @@ def build_ask_graph(llm: DeepSeekChatClient):
                 }
             )
 
+        _check_cancel()
         writer(
             {
                 "type": "rewrite_done",
@@ -84,6 +97,7 @@ def build_ask_graph(llm: DeepSeekChatClient):
         writer = get_stream_writer()
         optimized = (state.get("optimized_query") or state.get("original_query") or "").strip()
         writer({"type": "stage", "stage": "retrieve", "status": "start"})
+        _check_cancel()
 
         final_top_k = int(state.get("top_k") or settings.rag_default_top_k)
         fetch_k = max(settings.rag_fetch_k, final_top_k)
@@ -95,6 +109,7 @@ def build_ask_graph(llm: DeepSeekChatClient):
 
         try:
             # 1) 向量检索
+            _check_cancel()
             writer({"type": "retrieve_step", "step": "vector", "status": "start"})
             vector_hits = await anyio.to_thread.run_sync(
                 lambda: search_vector_hits(
@@ -121,6 +136,7 @@ def build_ask_graph(llm: DeepSeekChatClient):
             # 2) 关键字检索
             keyword_hits: list[dict[str, Any]] = []
             if settings.rag_hybrid_enabled:
+                _check_cancel()
                 writer({"type": "retrieve_step", "step": "keyword", "status": "start"})
                 keyword_hits = await anyio.to_thread.run_sync(
                     lambda: search_keyword_hits(
@@ -144,6 +160,7 @@ def build_ask_graph(llm: DeepSeekChatClient):
                 )
 
             # 3) RRF 融合
+            _check_cancel()
             writer({"type": "retrieve_step", "step": "rrf", "status": "start"})
             candidates = await anyio.to_thread.run_sync(
                 lambda: fuse_hits(
@@ -165,6 +182,7 @@ def build_ask_graph(llm: DeepSeekChatClient):
             )
 
             # 4) Rerank 精排
+            _check_cancel()
             writer({"type": "retrieve_step", "step": "rerank", "status": "start"})
             final_hits = await anyio.to_thread.run_sync(
                 lambda: rerank_hits(
@@ -184,6 +202,8 @@ def build_ask_graph(llm: DeepSeekChatClient):
                     "hits": hits,
                 }
             )
+        except AskCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001
             message = str(exc)
             writer({"type": "error", "stage": "retrieve", "message": message})
@@ -195,6 +215,7 @@ def build_ask_graph(llm: DeepSeekChatClient):
                 "error_message": message,
             }
 
+        _check_cancel()
         total = len(hits)
         writer(
             {
@@ -216,6 +237,7 @@ def build_ask_graph(llm: DeepSeekChatClient):
     async def answer_node(state: AskState) -> dict[str, Any]:
         writer = get_stream_writer()
         writer({"type": "stage", "stage": "answer", "status": "start"})
+        _check_cancel()
         original = (state.get("original_query") or "").strip()
         optimized = (state.get("optimized_query") or original).strip()
         hits = state.get("hits") or []
@@ -227,9 +249,12 @@ def build_ask_graph(llm: DeepSeekChatClient):
                 original_query=original,
                 optimized_query=optimized,
                 hits=hits,
+                cancel=cancel,
             ):
                 answer_parts.append(delta)
                 writer({"type": "answer_delta", "delta": delta})
+        except AskCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001
             message = str(exc)
             writer({"type": "error", "stage": "answer", "message": message})

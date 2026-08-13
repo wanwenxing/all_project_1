@@ -43,14 +43,23 @@ class FakeLLM(DeepSeekChatClient):
         return
 
 
-async def _fake_rewrite(_llm, original: str):
+async def _fake_rewrite(_llm, original: str, *, cancel=None):
     for part in ["优化:", original[:8]]:
         yield part
 
 
-async def _fake_answer(_llm, *, original_query, optimized_query, hits):
+async def _fake_answer(_llm, *, original_query, optimized_query, hits, cancel=None):
     yield "根据材料："
     yield f"命中{len(hits)}条。"
+
+
+async def _fake_rewrite_then_cancel(_llm, original: str, *, cancel=None):
+    yield "优化中"
+    if cancel is not None:
+        cancel.cancel()
+    from app.core.ask_cancel import AskCancelled
+
+    raise AskCancelled("ask cancelled by client")
 
 
 def test_ask_requires_auth(client):
@@ -183,3 +192,41 @@ def test_llm_not_configured_raises():
         raise AssertionError("expected LLMNotConfiguredError")
     except LLMNotConfiguredError:
         pass
+
+
+def test_ask_cancelled_stops_llm_and_logs(client, monkeypatch):
+    monkeypatch.setattr(settings, "llm_api_key", "fake-key")
+    fake = FakeLLM()
+    monkeypatch.setattr("app.services.ask.get_llm_client", lambda: fake)
+    monkeypatch.setattr("app.rag.ask_graph.rewrite_query_stream", _fake_rewrite_then_cancel)
+    monkeypatch.setattr("app.rag.ask_graph.answer_from_hits_stream", _fake_answer)
+    monkeypatch.setattr("app.rag.ask_graph.search_vector_hits", lambda **kwargs: [])
+    monkeypatch.setattr("app.rag.ask_graph.search_keyword_hits", lambda **kwargs: [])
+
+    headers = _auth_headers(client)
+    with client.stream(
+        "POST",
+        "/api/docs/ask",
+        headers=headers,
+        json={"query": "中途取消测试"},
+    ) as response:
+        assert response.status_code == 200
+        body = "".join(response.iter_text())
+
+    events = _parse_sse(body)
+    types = [e["type"] for e in events]
+    # 节点抛取消时 LangGraph 可能来不及刷出 rewrite_delta，以「未进入检索/回答」为准
+    assert "answer_delta" not in types
+    assert "retrieve_done" not in types
+    assert types[-1] == "done"
+    assert events[-1].get("cancelled") is True
+    assert events[-1].get("ok") is False
+
+    db = db_session.SessionLocal()
+    try:
+        row = db.execute(select(AskLog).order_by(AskLog.id.desc())).scalars().first()
+        assert row is not None
+        assert row.status == "cancelled"
+        assert row.original_query == "中途取消测试"
+    finally:
+        db.close()

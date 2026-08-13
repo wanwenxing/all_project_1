@@ -7,10 +7,11 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.core.ask_cancel import AskCancelled, AskCancelToken
 from app.core.config import settings
+from app.llm import DeepSeekChatClient, LLMNotConfiguredError, get_llm_client
 from app.models.ask_log import AskLog
 from app.rag.ask_graph import AskState, build_ask_graph
-from app.llm import DeepSeekChatClient, LLMNotConfiguredError, get_llm_client
 
 
 def _sse(payload: dict[str, Any]) -> str:
@@ -67,6 +68,7 @@ async def ask_knowledge_base_stream(
     user_id: int | None = None,
     db: Session | None = None,
     llm: DeepSeekChatClient | None = None,
+    cancel: AskCancelToken | None = None,
 ) -> AsyncIterator[str]:
     """跑 LangGraph 并 yield SSE；结束后写入 ask_logs。"""
     original = query.strip()
@@ -94,7 +96,25 @@ async def ask_knowledge_base_stream(
         )
         return
 
-    graph = build_ask_graph(client)
+    if cancel is not None and cancel.is_cancelled:
+        yield _sse({"type": "done", "ok": False, "cancelled": True})
+        _persist_ask_log(
+            db,
+            user_id=user_id,
+            original_query=original,
+            optimized_query=None,
+            rewrite_fallback=False,
+            hits=[],
+            answer=None,
+            status="cancelled",
+            error_stage=None,
+            error_message="cancelled before start",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            model=client.model,
+        )
+        return
+
+    graph = build_ask_graph(client, cancel=cancel)
     initial: AskState = {
         "original_query": original,
         "optimized_query": original,
@@ -121,12 +141,16 @@ async def ask_knowledge_base_stream(
     status = "success"
     error_stage: str | None = None
     error_message: str | None = None
+    terminal_events: list[dict[str, Any]] = []
 
     try:
         async for mode, chunk in graph.astream(
             initial,
             stream_mode=["custom", "values"],
         ):
+            if cancel is not None:
+                cancel.throw_if_cancelled()
+
             if mode == "custom" and isinstance(chunk, dict):
                 event_type = chunk.get("type")
                 if event_type == "rewrite_done":
@@ -163,24 +187,42 @@ async def ask_knowledge_base_stream(
                     status = "error"
                     error_stage = chunk.get("error_stage") or error_stage
                     error_message = chunk.get("error_message") or error_message
+    except AskCancelled:
+        status = "cancelled"
+        error_stage = None
+        error_message = "cancelled by client"
+        terminal_events.append({"type": "done", "ok": False, "cancelled": True})
     except Exception as exc:  # noqa: BLE001
-        status = "error"
-        error_stage = error_stage or "answer"
-        error_message = str(exc)
-        yield _sse({"type": "error", "stage": error_stage, "message": error_message})
-        yield _sse({"type": "done", "ok": False})
+        # 部分底层会把取消包成其它异常；token 已置位则仍记 cancelled
+        if cancel is not None and cancel.is_cancelled:
+            status = "cancelled"
+            error_stage = None
+            error_message = "cancelled by client"
+            terminal_events.append({"type": "done", "ok": False, "cancelled": True})
+        else:
+            status = "error"
+            error_stage = error_stage or "answer"
+            error_message = str(exc)
+            terminal_events.append(
+                {"type": "error", "stage": error_stage, "message": error_message}
+            )
+            terminal_events.append({"type": "done", "ok": False})
+    finally:
+        # 必须在继续 yield 前写库：消费者断开时后续 yield 可能触发 GeneratorExit
+        _persist_ask_log(
+            db,
+            user_id=user_id,
+            original_query=original,
+            optimized_query=optimized_query,
+            rewrite_fallback=rewrite_fallback,
+            hits=hits,
+            answer=answer,
+            status=status,
+            error_stage=error_stage,
+            error_message=error_message,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            model=client.model,
+        )
 
-    _persist_ask_log(
-        db,
-        user_id=user_id,
-        original_query=original,
-        optimized_query=optimized_query,
-        rewrite_fallback=rewrite_fallback,
-        hits=hits,
-        answer=answer,
-        status=status,
-        error_stage=error_stage,
-        error_message=error_message,
-        duration_ms=int((time.perf_counter() - started) * 1000),
-        model=client.model,
-    )
+    for event in terminal_events:
+        yield _sse(event)

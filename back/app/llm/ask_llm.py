@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
+from app.core.ask_cancel import AskCancelToken
 from app.llm.client import DeepSeekChatClient
 
 REWRITE_SYSTEM = (
@@ -39,12 +40,15 @@ def format_hits(hits: list[dict[str, Any]]) -> str:
 async def rewrite_query_stream(
     llm: DeepSeekChatClient,
     original: str,
+    *,
+    cancel: AskCancelToken | None = None,
 ) -> AsyncIterator[str]:
     user = f"用户原问题：\n{original.strip()}"
     async for delta in llm.stream_chat(
         system=REWRITE_SYSTEM,
         user=user,
         temperature=0.1,
+        cancel=cancel,
     ):
         yield delta
 
@@ -55,6 +59,7 @@ async def answer_from_hits_stream(
     original_query: str,
     optimized_query: str,
     hits: list[dict[str, Any]],
+    cancel: AskCancelToken | None = None,
 ) -> AsyncIterator[str]:
     materials = format_hits(hits)
     user = (
@@ -67,5 +72,6 @@ async def answer_from_hits_stream(
         system=ANSWER_SYSTEM,
         user=user,
         temperature=0.3,
+        cancel=cancel,
     ):
         yield delta

@@ -1,7 +1,11 @@
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+import asyncio
+from contextlib import suppress
+
+from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.core.ask_cancel import AskCancelToken
 from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.user import User
@@ -58,8 +62,26 @@ def search_documents(
     return success(SearchResultData(**data), message="检索完成")
 
 
+async def _watch_disconnect(request: Request, cancel: AskCancelToken) -> None:
+    """前端 abort 后连接断开，这里打取消标记，供编排/LLM 停止。"""
+    try:
+        while not cancel.is_cancelled:
+            try:
+                # TestClient / 部分环境里 is_disconnected 可能很慢或挂起，加超时避免拖死整次 Ask
+                disconnected = await asyncio.wait_for(request.is_disconnected(), timeout=0.3)
+            except (asyncio.TimeoutError, Exception):
+                disconnected = False
+            if disconnected:
+                cancel.cancel()
+                return
+            await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        return
+
+
 @router.post("/ask")
 async def ask_documents(
+    request: Request,
     payload: AskRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -67,16 +89,28 @@ async def ask_documents(
     """SSE：rewrite → retrieve → answer（LangGraph），并写入 ask_logs。"""
 
     async def event_generator():
-        async for frame in ask_knowledge_base_stream(
-            query=payload.query,
-            top_k=payload.top_k,
-            source_path=payload.source_path,
-            title=payload.title,
-            updated_at=payload.updated_at,
-            user_id=current_user.id,
-            db=db,
-        ):
-            yield frame
+        cancel = AskCancelToken()
+        watcher = asyncio.create_task(_watch_disconnect(request, cancel))
+        try:
+            async for frame in ask_knowledge_base_stream(
+                query=payload.query,
+                top_k=payload.top_k,
+                source_path=payload.source_path,
+                title=payload.title,
+                updated_at=payload.updated_at,
+                user_id=current_user.id,
+                db=db,
+                cancel=cancel,
+            ):
+                yield frame
+                # 已取消则不再继续读（收尾帧已在上方 yield）
+                if cancel.is_cancelled:
+                    break
+        finally:
+            cancel.cancel()
+            watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await watcher
 
     return StreamingResponse(
         event_generator(),

@@ -5,11 +5,21 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from app.core.ask_cancel import AskCancelled, AskCancelToken
 from app.core.config import settings
 
 
 class LLMNotConfiguredError(RuntimeError):
     """Raised when LLM_API_KEY is missing."""
+
+
+async def _aclose_stream(stream: Any) -> None:
+    close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+    if close is None:
+        return
+    result = close()
+    if hasattr(result, "__await__"):
+        await result
 
 
 class DeepSeekChatClient:
@@ -51,8 +61,15 @@ class DeepSeekChatClient:
         user: str,
         temperature: float = 0.2,
         disable_thinking: bool = True,
+        cancel: AskCancelToken | None = None,
     ) -> AsyncIterator[str]:
-        """通用流式 chat.completions；默认关闭思考模式，仅产出正文 content。"""
+        """通用流式 chat.completions；默认关闭思考模式，仅产出正文 content。
+
+        若传入 cancel，用户中途取消时会关掉上游 LLM 流并抛出 AskCancelled。
+        """
+        if cancel is not None:
+            cancel.throw_if_cancelled()
+
         client = self._get_client()
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -63,24 +80,34 @@ class DeepSeekChatClient:
                 {"role": "user", "content": user},
             ],
         }
-        if disable_thinking:
-            try:
-                stream = await client.chat.completions.create(
-                    **kwargs,
-                    extra_body={"thinking": {"type": "disabled"}},
-                )
-            except TypeError:
-                stream = await client.chat.completions.create(**kwargs)
-        else:
-            stream = await client.chat.completions.create(**kwargs)
 
-        async for chunk in stream:
-            choice = chunk.choices[0] if chunk.choices else None
-            if choice is None or choice.delta is None:
-                continue
-            content = choice.delta.content
-            if content:
-                yield content
+        stream = None
+        try:
+            if disable_thinking:
+                try:
+                    stream = await client.chat.completions.create(
+                        **kwargs,
+                        extra_body={"thinking": {"type": "disabled"}},
+                    )
+                except TypeError:
+                    stream = await client.chat.completions.create(**kwargs)
+            else:
+                stream = await client.chat.completions.create(**kwargs)
+
+            async for chunk in stream:
+                if cancel is not None:
+                    cancel.throw_if_cancelled()
+                choice = chunk.choices[0] if chunk.choices else None
+                if choice is None or choice.delta is None:
+                    continue
+                content = choice.delta.content
+                if content:
+                    yield content
+        except AskCancelled:
+            raise
+        finally:
+            if stream is not None:
+                await _aclose_stream(stream)
 
 
 def get_llm_client() -> DeepSeekChatClient:
