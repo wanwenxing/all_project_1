@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.security import TOKEN_REFRESH_HEADER, create_access_token, verify_password
-from app.db.session import SessionLocal
+from app.db import session as db_session
 from app.services.user import get_user_by_username
 
 
@@ -61,7 +61,7 @@ def test_password_is_hashed_in_database(client):
     response = client.post("/api/auth/register", json=payload)
     assert response.status_code == 200
 
-    db: Session = SessionLocal()
+    db: Session = db_session.SessionLocal()
     try:
         user = get_user_by_username(db, "hashuser")
         assert user is not None

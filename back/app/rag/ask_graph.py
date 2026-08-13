@@ -8,7 +8,14 @@ from langgraph.graph import END, START, StateGraph
 
 from app.llm import DeepSeekChatClient
 from app.llm.ask_llm import answer_from_hits_stream, rewrite_query_stream
-from app.services.docs import search_knowledge_base
+from app.core.config import settings
+from app.services.docs import (
+    _public_hits,
+    fuse_hits,
+    rerank_hits,
+    search_keyword_hits,
+    search_vector_hits,
+)
 
 
 class AskState(TypedDict, total=False):
@@ -78,15 +85,104 @@ def build_ask_graph(llm: DeepSeekChatClient):
         optimized = (state.get("optimized_query") or state.get("original_query") or "").strip()
         writer({"type": "stage", "stage": "retrieve", "status": "start"})
 
+        final_top_k = int(state.get("top_k") or settings.rag_default_top_k)
+        fetch_k = max(settings.rag_fetch_k, final_top_k)
+        candidate_k = max(settings.rag_candidate_k, final_top_k)
+        source_path = state.get("source_path")
+        title = state.get("title")
+        updated_at = state.get("updated_at")
+        apply_min_score = not settings.rag_rerank_enabled
+
         try:
-            search_result = await anyio.to_thread.run_sync(
-                lambda: search_knowledge_base(
+            # 1) 向量检索
+            writer({"type": "retrieve_step", "step": "vector", "status": "start"})
+            vector_hits = await anyio.to_thread.run_sync(
+                lambda: search_vector_hits(
                     query=optimized,
-                    top_k=int(state.get("top_k") or 2),
-                    source_path=state.get("source_path"),
-                    title=state.get("title"),
-                    updated_at=state.get("updated_at"),
+                    fetch_k=fetch_k,
+                    source_path=source_path,
+                    title=title,
+                    updated_at=updated_at,
+                    apply_min_score=apply_min_score,
                 )
+            )
+            vector_public = _public_hits(vector_hits)
+            writer(
+                {
+                    "type": "retrieve_step",
+                    "step": "vector",
+                    "status": "done",
+                    "query": optimized,
+                    "total": len(vector_public),
+                    "hits": vector_public,
+                }
+            )
+
+            # 2) 关键字检索
+            keyword_hits: list[dict[str, Any]] = []
+            if settings.rag_hybrid_enabled:
+                writer({"type": "retrieve_step", "step": "keyword", "status": "start"})
+                keyword_hits = await anyio.to_thread.run_sync(
+                    lambda: search_keyword_hits(
+                        query=optimized,
+                        fetch_k=fetch_k,
+                        source_path=source_path,
+                        title=title,
+                        updated_at=updated_at,
+                    )
+                )
+                keyword_public = _public_hits(keyword_hits)
+                writer(
+                    {
+                        "type": "retrieve_step",
+                        "step": "keyword",
+                        "status": "done",
+                        "query": optimized,
+                        "total": len(keyword_public),
+                        "hits": keyword_public,
+                    }
+                )
+
+            # 3) RRF 融合
+            writer({"type": "retrieve_step", "step": "rrf", "status": "start"})
+            candidates = await anyio.to_thread.run_sync(
+                lambda: fuse_hits(
+                    vector_hits,
+                    keyword_hits,
+                    candidate_k=candidate_k,
+                )
+            )
+            rrf_public = _public_hits(candidates)
+            writer(
+                {
+                    "type": "retrieve_step",
+                    "step": "rrf",
+                    "status": "done",
+                    "query": optimized,
+                    "total": len(rrf_public),
+                    "hits": rrf_public,
+                }
+            )
+
+            # 4) Rerank 精排
+            writer({"type": "retrieve_step", "step": "rerank", "status": "start"})
+            final_hits = await anyio.to_thread.run_sync(
+                lambda: rerank_hits(
+                    query=optimized,
+                    candidates=candidates,
+                    top_k=final_top_k,
+                )
+            )
+            hits = _public_hits(final_hits)
+            writer(
+                {
+                    "type": "retrieve_step",
+                    "step": "rerank",
+                    "status": "done",
+                    "query": optimized,
+                    "total": len(hits),
+                    "hits": hits,
+                }
             )
         except Exception as exc:  # noqa: BLE001
             message = str(exc)
@@ -99,8 +195,7 @@ def build_ask_graph(llm: DeepSeekChatClient):
                 "error_message": message,
             }
 
-        hits = search_result.get("hits") or []
-        total = int(search_result.get("total", len(hits)))
+        total = len(hits)
         writer(
             {
                 "type": "retrieve_done",
@@ -172,10 +267,10 @@ def build_ask_graph(llm: DeepSeekChatClient):
         return {"ok": False}
 
     graph = StateGraph(AskState)
-    graph.add_node("rewrite", rewrite_node) # 问题优化节点
-    graph.add_node("retrieve", retrieve_node) # 向量检索节点
-    graph.add_node("answer", answer_node) # 答案生成节点
-    graph.add_node("finish_error", finish_error_node) # 错误处理节点
+    graph.add_node("rewrite", rewrite_node)  # 问题优化
+    graph.add_node("retrieve", retrieve_node)  # 混合检索（逐步 SSE）
+    graph.add_node("answer", answer_node)  # 答案生成
+    graph.add_node("finish_error", finish_error_node)  # 错误收尾
 
     graph.add_edge(START, "rewrite")
     graph.add_edge("rewrite", "retrieve")

@@ -3,7 +3,7 @@ import json
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.db.session import SessionLocal
+from app.db import session as db_session
 from app.models.ask_log import AskLog
 from app.llm import DeepSeekChatClient, LLMNotConfiguredError
 
@@ -66,26 +66,33 @@ def test_ask_sse_event_order_and_log(client, monkeypatch):
     monkeypatch.setattr("app.rag.ask_graph.rewrite_query_stream", _fake_rewrite)
     monkeypatch.setattr("app.rag.ask_graph.answer_from_hits_stream", _fake_answer)
     monkeypatch.setattr(
-        "app.rag.ask_graph.search_knowledge_base",
-        lambda **kwargs: {
-            "query": kwargs["query"],
-            "total": 1,
-            "hits": [
-                {
-                    "chroma_id": "chunk:1",
-                    "content": "长久胜过一般的爱情",
-                    "distance": 0.1,
-                    "score": 0.9,
-                    "document_id": "1",
-                    "chunk_id": "1",
-                    "chunk_index": 0,
-                    "source_path": "docs/友情.md",
-                    "title": "友情",
-                    "updated_at": "2026年6月",
-                }
-            ],
-        },
+        "app.rag.ask_graph.search_vector_hits",
+        lambda **kwargs: [
+            {
+                "chroma_id": "chunk:1",
+                "content": "长久胜过一般的爱情",
+                "distance": 0.1,
+                "score": 0.9,
+                "document_id": "1",
+                "chunk_id": "1",
+                "chunk_index": 0,
+                "source_path": "docs/友情.md",
+                "title": "友情",
+                "updated_at": "2026年6月",
+            }
+        ],
     )
+    monkeypatch.setattr("app.rag.ask_graph.search_keyword_hits", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "app.rag.ask_graph.fuse_hits",
+        lambda vector_hits, keyword_hits, **kwargs: vector_hits[: kwargs.get("candidate_k", 5)],
+    )
+    monkeypatch.setattr(
+        "app.rag.ask_graph.rerank_hits",
+        lambda **kwargs: (kwargs.get("candidates") or [])[: kwargs.get("top_k", 2)],
+    )
+    monkeypatch.setattr(settings, "rag_hybrid_enabled", True)
+    monkeypatch.setattr(settings, "rag_rerank_enabled", True)
 
     headers = _auth_headers(client)
     with client.stream(
@@ -103,6 +110,10 @@ def test_ask_sse_event_order_and_log(client, monkeypatch):
     assert types[0] == "stage" and events[0]["stage"] == "rewrite"
     assert "rewrite_delta" in types
     assert "rewrite_done" in types
+    assert "retrieve_step" in types
+    step_events = [e for e in events if e["type"] == "retrieve_step" and e.get("status") == "done"]
+    steps = [e.get("step") for e in step_events]
+    assert steps == ["vector", "keyword", "rrf", "rerank"]
     assert "retrieve_done" in types
     assert "answer_delta" in types
     assert "answer_done" in types
@@ -115,7 +126,7 @@ def test_ask_sse_event_order_and_log(client, monkeypatch):
     answer_done = next(e for e in events if e["type"] == "answer_done")
     assert "命中1条" in answer_done["answer"]
 
-    db = SessionLocal()
+    db = db_session.SessionLocal()
     try:
         row = db.execute(select(AskLog).order_by(AskLog.id.desc())).scalars().first()
         assert row is not None
@@ -155,7 +166,7 @@ def test_ask_missing_api_key(client, monkeypatch):
     assert "LLM_API_KEY" in events[0]["message"]
     assert types[-1] == "done" and events[-1]["ok"] is False
 
-    db = SessionLocal()
+    db = db_session.SessionLocal()
     try:
         row = db.execute(select(AskLog).order_by(AskLog.id.desc())).scalars().first()
         assert row is not None

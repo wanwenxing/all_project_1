@@ -9,6 +9,7 @@ export interface UploadDocData {
 export interface IndexStatsData {
   indexed: number
   skipped: number
+  metadata_updated: number
   removed: number
   chunks: number
 }
@@ -69,6 +70,7 @@ export type AskSseEvent = {
   type: string
   stage?: string
   status?: string
+  step?: string
   delta?: string
   original_query?: string
   optimized_query?: string

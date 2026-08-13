@@ -130,7 +130,8 @@ SSE 每条 `data:` 为 JSON，核心 `type`：
 |------|------|
 | `stage` | `rewrite` / `retrieve` / `answer`，`status` 为 `start` 或 `done` |
 | `rewrite_delta` / `rewrite_done` | 问题优化增量与最终问句 |
-| `retrieve_done` | 检索 hits |
+| `retrieve_step` | 混合检索逐步结果：`step` 为 `vector` / `keyword` / `rrf` / `rerank`，`status` 为 `start`/`done`，`done` 时带 `hits` |
+| `retrieve_done` | 最终送给 LLM 的 hits |
 | `answer_delta` / `answer_done` | 润色回答增量与全文 |
 | `error` | 失败（含 `stage`；改写失败可 `fallback` 后继续） |
 | `done` | 整次结束（`ok: true/false`） |

@@ -179,6 +179,93 @@ def _public_hit(hit: dict) -> dict:
     }
 
 
+def _public_hits(hits: list[dict]) -> list[dict]:
+    return [_public_hit(hit) for hit in hits]
+
+
+def search_vector_hits(
+    *,
+    query: str,
+    fetch_k: int,
+    source_path: str | None = None,
+    title: str | None = None,
+    updated_at: str | None = None,
+    apply_min_score: bool = False,
+) -> list[dict]:
+    where = _build_chroma_where(
+        source_path=source_path,
+        title=title,
+        updated_at=updated_at,
+    )
+    embedding = get_embedder().embed_query(query)
+    raw_vector_hits = get_chroma_store().query(
+        embedding,
+        n_results=fetch_k,
+        where=where,
+    )
+    vector_hits = _normalize_vector_hits(raw_vector_hits)
+    if apply_min_score:
+        min_score = settings.rag_min_score
+        vector_hits = [
+            hit
+            for hit in vector_hits
+            if hit.get("score") is None or float(hit["score"]) >= min_score
+        ]
+    return vector_hits
+
+
+def search_keyword_hits(
+    *,
+    query: str,
+    fetch_k: int,
+    source_path: str | None = None,
+    title: str | None = None,
+    updated_at: str | None = None,
+) -> list[dict]:
+    db = SessionLocal()
+    try:
+        return FTSStore(db).search(
+            query,
+            limit=fetch_k,
+            source_path=source_path,
+            title=title,
+            updated_at=updated_at,
+        )
+    finally:
+        db.close()
+
+
+def fuse_hits(
+    vector_hits: list[dict],
+    keyword_hits: list[dict],
+    *,
+    candidate_k: int,
+    hybrid_enabled: bool | None = None,
+) -> list[dict]:
+    enabled = settings.rag_hybrid_enabled if hybrid_enabled is None else hybrid_enabled
+    if enabled:
+        return rrf_fuse(
+            vector_hits,
+            keyword_hits,
+            k=settings.rag_rrf_k,
+            limit=candidate_k,
+        )
+    return vector_hits[:candidate_k]
+
+
+def rerank_hits(
+    *,
+    query: str,
+    candidates: list[dict],
+    top_k: int,
+    rerank_enabled: bool | None = None,
+) -> list[dict]:
+    enabled = settings.rag_rerank_enabled if rerank_enabled is None else rerank_enabled
+    if enabled and candidates:
+        return get_reranker().rerank(query, candidates, top_k=top_k)
+    return candidates[:top_k]
+
+
 def search_knowledge_base(
     *,
     query: str,
@@ -194,60 +281,35 @@ def search_knowledge_base(
     final_top_k = settings.rag_default_top_k if top_k is None else top_k
     fetch_k = max(settings.rag_fetch_k, final_top_k)
     candidate_k = max(settings.rag_candidate_k, final_top_k)
+    apply_min_score = not settings.rag_rerank_enabled
 
-    where = _build_chroma_where(
+    vector_hits = search_vector_hits(
+        query=text,
+        fetch_k=fetch_k,
         source_path=source_path,
         title=title,
         updated_at=updated_at,
+        apply_min_score=apply_min_score,
     )
-    embedding = get_embedder().embed_query(text)
-    raw_vector_hits = get_chroma_store().query(
-        embedding,
-        n_results=fetch_k,
-        where=where,
-    )
-    vector_hits = _normalize_vector_hits(raw_vector_hits)
-
-    # 未启用 rerank 时，仍可用向量阈值做粗过滤
-    if not settings.rag_rerank_enabled:
-        min_score = settings.rag_min_score
-        vector_hits = [
-            hit
-            for hit in vector_hits
-            if hit.get("score") is None or float(hit["score"]) >= min_score
-        ]
-
     keyword_hits: list[dict] = []
     if settings.rag_hybrid_enabled:
-        db = SessionLocal()
-        try:
-            keyword_hits = FTSStore(db).search(
-                text,
-                limit=fetch_k,
-                source_path=source_path,
-                title=title,
-                updated_at=updated_at,
-            )
-        finally:
-            db.close()
-
-    if settings.rag_hybrid_enabled:
-        candidates = rrf_fuse(
-            vector_hits,
-            keyword_hits,
-            k=settings.rag_rrf_k,
-            limit=candidate_k,
+        keyword_hits = search_keyword_hits(
+            query=text,
+            fetch_k=fetch_k,
+            source_path=source_path,
+            title=title,
+            updated_at=updated_at,
         )
-    else:
-        candidates = vector_hits[:candidate_k]
 
-    if settings.rag_rerank_enabled and candidates:
-        hits = get_reranker().rerank(text, candidates, top_k=final_top_k)
-    else:
-        hits = candidates[:final_top_k]
+    candidates = fuse_hits(
+        vector_hits,
+        keyword_hits,
+        candidate_k=candidate_k,
+    )
+    hits = rerank_hits(query=text, candidates=candidates, top_k=final_top_k)
 
     return {
         "query": text,
         "total": len(hits),
-        "hits": [_public_hit(hit) for hit in hits],
+        "hits": _public_hits(hits),
     }
