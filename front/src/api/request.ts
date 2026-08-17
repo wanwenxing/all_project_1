@@ -90,6 +90,10 @@ export const http = {
     return request.put(url, data, config)
   },
 
+  patch<T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T> {
+    return request.patch(url, data, config)
+  },
+
   delete<T>(url: string, config?: AxiosRequestConfig): Promise<T> {
     return request.delete(url, config)
   },

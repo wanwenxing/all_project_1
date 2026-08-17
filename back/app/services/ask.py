@@ -247,3 +247,98 @@ async def ask_knowledge_base_stream(
 
     for event in terminal_events:
         yield _sse(event)
+
+
+def _parse_sse_payload(frame: str) -> dict[str, Any] | None:
+    for line in frame.split("\n"):
+        trimmed = line.strip()
+        if not trimmed.startswith("data:"):
+            continue
+        raw = trimmed[5:].strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+async def ask_knowledge_base(
+    *,
+    query: str,
+    top_k: int = 2,
+    source_path: str | None = None,
+    title: str | None = None,
+    updated_at: str | None = None,
+    user_id: int | None = None,
+    db: Session | None = None,
+    llm: DeepSeekChatClient | None = None,
+    cancel: AskCancelToken | None = None,
+) -> dict[str, Any]:
+    """非 SSE 聚合调用：跑完整 Ask 编排，返回结构化结果（评测等场景使用）。"""
+    started = time.perf_counter()
+    original = query.strip()
+    optimized_query = original
+    rewrite_fallback = False
+    hits: list[dict[str, Any]] = []
+    answer: str | None = None
+    status = "success"
+    error_stage: str | None = None
+    error_message: str | None = None
+    model: str | None = None
+
+    client = llm or get_llm_client()
+    model = client.model
+
+    async for frame in ask_knowledge_base_stream(
+        query=original,
+        top_k=top_k,
+        source_path=source_path,
+        title=title,
+        updated_at=updated_at,
+        user_id=user_id,
+        db=db,
+        llm=client,
+        cancel=cancel,
+    ):
+        payload = _parse_sse_payload(frame)
+        if not payload:
+            continue
+        event_type = payload.get("type")
+        if event_type == "rewrite_done":
+            optimized_query = payload.get("optimized_query") or optimized_query
+            rewrite_fallback = bool(payload.get("fallback"))
+        elif event_type == "retrieve_done":
+            hits = list(payload.get("hits") or [])
+        elif event_type == "answer_done":
+            answer = payload.get("answer")
+            if payload.get("hits"):
+                hits = list(payload.get("hits") or hits)
+        elif event_type == "error":
+            if payload.get("fallback"):
+                continue
+            status = "error"
+            error_stage = payload.get("stage") or error_stage
+            error_message = payload.get("message") or error_message
+        elif event_type == "done":
+            if payload.get("ok") is False:
+                status = "error" if status == "success" else status
+            if payload.get("cancelled"):
+                status = "cancelled"
+
+    return {
+        "ok": status == "success",
+        "status": status,
+        "original_query": original,
+        "optimized_query": optimized_query,
+        "rewrite_fallback": rewrite_fallback,
+        "hits": hits,
+        "answer": answer,
+        "error_stage": error_stage,
+        "error_message": error_message,
+        "duration_ms": int((time.perf_counter() - started) * 1000),
+        "model": model,
+    }

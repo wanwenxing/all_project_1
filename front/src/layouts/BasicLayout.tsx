@@ -6,6 +6,8 @@ const { Header, Content, Footer } = Layout
 const menuItems = [
   { key: '/', label: '首页' },
   { key: '/knowledge', label: '知识库' },
+  { key: '/evals/cases', label: '评测题库' },
+  { key: '/evals/runs', label: '测评任务' },
   { key: '/about', label: '关于' },
 ]
 

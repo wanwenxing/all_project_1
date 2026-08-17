@@ -111,6 +111,45 @@ class DeepSeekChatClient:
             if stream is not None:
                 await _aclose_stream(stream)
 
+    async def chat(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float = 0.1,
+        disable_thinking: bool = True,
+    ) -> str:
+        """非流式 chat，适合 Judge 等需要完整 JSON 的场景。"""
+        client = self._get_client()
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "temperature": temperature,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        try:
+            if disable_thinking:
+                try:
+                    resp = await client.chat.completions.create(
+                        **kwargs,
+                        extra_body={"thinking": {"type": "disabled"}},
+                    )
+                except TypeError:
+                    resp = await client.chat.completions.create(**kwargs)
+            else:
+                resp = await client.chat.completions.create(**kwargs)
+        except APITimeoutError as exc:
+            raise LLMTimeoutError(
+                f"模型响应超时（>{self.timeout:.0f}s），请稍后重试"
+            ) from exc
+
+        choice = resp.choices[0] if resp.choices else None
+        content = choice.message.content if choice and choice.message else None
+        return (content or "").strip()
+
 
 def get_llm_client() -> DeepSeekChatClient:
     return DeepSeekChatClient()

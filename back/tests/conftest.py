@@ -7,7 +7,7 @@ from sqlalchemy.pool import StaticPool
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
-from app.models import ask_log, document, document_chunk, user  # noqa: F401
+from app.models import ask_log, document, document_chunk, eval_models, user  # noqa: F401
 
 
 @pytest.fixture
