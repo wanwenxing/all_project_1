@@ -111,6 +111,58 @@ class DeepSeekChatClient:
             if stream is not None:
                 await _aclose_stream(stream)
 
+    async def stream_chat_messages(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.3,
+        disable_thinking: bool = True,
+        cancel: AskCancelToken | None = None,
+    ) -> AsyncIterator[str]:
+        """多轮 messages 流式输出（含 system / user / assistant）。"""
+        if cancel is not None:
+            cancel.throw_if_cancelled()
+
+        client = self._get_client()
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "temperature": temperature,
+            "stream": True,
+            "messages": messages,
+        }
+
+        stream = None
+        try:
+            if disable_thinking:
+                try:
+                    stream = await client.chat.completions.create(
+                        **kwargs,
+                        extra_body={"thinking": {"type": "disabled"}},
+                    )
+                except TypeError:
+                    stream = await client.chat.completions.create(**kwargs)
+            else:
+                stream = await client.chat.completions.create(**kwargs)
+
+            async for chunk in stream:
+                if cancel is not None:
+                    cancel.throw_if_cancelled()
+                choice = chunk.choices[0] if chunk.choices else None
+                if choice is None or choice.delta is None:
+                    continue
+                content = choice.delta.content
+                if content:
+                    yield content
+        except AskCancelled:
+            raise
+        except APITimeoutError as exc:
+            raise LLMTimeoutError(
+                f"模型响应超时（>{self.timeout:.0f}s），请稍后重试"
+            ) from exc
+        finally:
+            if stream is not None:
+                await _aclose_stream(stream)
+
     async def chat(
         self,
         *,

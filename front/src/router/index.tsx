@@ -6,6 +6,7 @@ import EvalRunsPage from '@/pages/Eval/Runs'
 import Home from '@/pages/Home'
 import Knowledge from '@/pages/Knowledge'
 import Login from '@/pages/Login'
+import MemoryChat from '@/pages/MemoryChat'
 import Register from '@/pages/Register'
 import { createBrowserRouter } from 'react-router-dom'
 
@@ -21,6 +22,10 @@ const router = createBrowserRouter([
       {
         path: 'knowledge',
         element: <Knowledge />,
+      },
+      {
+        path: 'memory-chat',
+        element: <MemoryChat />,
       },
       {
         path: 'evals/cases',
