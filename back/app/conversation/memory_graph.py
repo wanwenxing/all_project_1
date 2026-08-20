@@ -12,11 +12,12 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
 
+from app.conversation.store_embeddings import get_store_embeddings
 from app.core.ask_cancel import AskCancelled, AskCancelToken
 from app.llm import DeepSeekChatClient
-from app.rag.store_embeddings import get_store_embeddings
 
-SHORT_TERM_KEEP = 6  # 约 3 轮对话
+SHORT_TERM_KEEP = 8  # 约 4 轮对话（user+assistant）
+MEMORY_SUMMARY_EVERY_ROUNDS = 4
 
 
 def _filter_messages(messages: list[Any]) -> list[Any]:
@@ -51,6 +52,18 @@ def _message_role(message: Any) -> str:
     return "user"
 
 
+def _count_user_turns(messages: list[Any]) -> int:
+    return sum(1 for msg in messages if _message_role(msg) == "user")
+
+
+def _format_transcript(messages: list[dict[str, str]]) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        role = "用户" if msg["role"] == "user" else "助手"
+        lines.append(f"{role}：{msg['content']}")
+    return "\n".join(lines)
+
+
 def _to_openai_messages(messages: list[Any]) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     for msg in messages:
@@ -62,6 +75,48 @@ def _to_openai_messages(messages: list[Any]) -> list[dict[str, str]]:
             continue
         result.append({"role": role, "content": content})
     return result
+
+
+async def _summarize_and_store_memory(
+    *,
+    llm: DeepSeekChatClient,
+    store: BaseStore,
+    namespace: tuple[str, ...],
+    transcript: list[dict[str, str]],
+    writer: Any,
+    cancel: AskCancelToken | None = None,
+) -> str | None:
+    """对近几轮对话做总结，写入长期记忆；无可记内容则返回 None。"""
+    if not transcript:
+        return None
+
+    writer({"type": "stage", "stage": "memory", "status": "save"})
+    if cancel is not None:
+        cancel.throw_if_cancelled()
+
+    try:
+        saved_fact = await llm.chat(
+            system=(
+                "你是对话记忆整理助手。根据近几轮对话，提炼需要长期记住的用户相关事实"
+                "（偏好、身份信息、约定、重要结论等）。"
+                "写成简洁中文陈述，可多条，每行一条；不要编号以外的废话。"
+                "若没有值得长期保存的内容，只输出空字符串。"
+            ),
+            user=_format_transcript(transcript),
+            temperature=0.1,
+        )
+    except AskCancelled:
+        raise
+    except Exception:  # noqa: BLE001
+        saved_fact = ""
+
+    saved_fact = (saved_fact or "").strip()
+    if not saved_fact:
+        return None
+
+    store.put(namespace, str(uuid.uuid4()), {"data": saved_fact})
+    writer({"type": "memory_saved", "data": saved_fact})
+    return saved_fact
 
 
 def build_memory_chat_graph_with_backends(
@@ -102,26 +157,6 @@ def build_memory_chat_graph_with_backends(
         if memory_lines:
             writer({"type": "memory_hits", "items": memory_lines})
 
-        if "记住" in last_content:
-            writer({"type": "stage", "stage": "memory", "status": "save"})
-            try:
-                saved_fact = await llm.chat(
-                    system=(
-                        "从用户话里抽出需要长期记住的事实，写成一句简洁中文陈述。"
-                        "只输出事实本身；若没有可记内容，输出空字符串。"
-                    ),
-                    user=last_content,
-                    temperature=0.1,
-                )
-            except Exception:  # noqa: BLE001
-                saved_fact = last_content.strip()
-            saved_fact = (saved_fact or "").strip()
-            if saved_fact:
-                store.put(namespace, str(uuid.uuid4()), {"data": saved_fact})
-                writer({"type": "memory_saved", "data": saved_fact})
-                if saved_fact not in memory_lines:
-                    memory_lines.append(saved_fact)
-
         info = "\n".join(f"- {line}" for line in memory_lines) or "（暂无）"
         system_msg = (
             "你是一个带有长期记忆的助手。"
@@ -148,6 +183,23 @@ def build_memory_chat_graph_with_backends(
 
         answer = "".join(chunks).strip()
         writer({"type": "answer_done", "answer": answer})
+
+        # 每满 4 轮（以用户发言次数计）后，总结近 4 轮并写入长期记忆
+        user_turns = _count_user_turns(messages)
+        if user_turns > 0 and user_turns % MEMORY_SUMMARY_EVERY_ROUNDS == 0:
+            history = _to_openai_messages(messages)
+            if answer:
+                history = [*history, {"role": "assistant", "content": answer}]
+            window = history[-(MEMORY_SUMMARY_EVERY_ROUNDS * 2) :]
+            await _summarize_and_store_memory(
+                llm=llm,
+                store=store,
+                namespace=namespace,
+                transcript=window,
+                writer=writer,
+                cancel=cancel,
+            )
+
         return {"messages": [{"role": "assistant", "content": answer}]}
 
     builder.add_node("chatbot", chatbot)

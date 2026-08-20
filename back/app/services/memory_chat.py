@@ -16,7 +16,7 @@ from app.core.ask_errors import (
     classify_ask_exception,
 )
 from app.llm import get_llm_client
-from app.rag.memory_graph import (
+from app.conversation.memory_graph import (
     build_memory_chat_graph_with_backends,
     create_shared_memory_backends,
 )
