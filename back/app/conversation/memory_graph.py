@@ -19,6 +19,34 @@ from app.llm import DeepSeekChatClient
 SHORT_TERM_KEEP = 8  # 约 4 轮对话（user+assistant）
 MEMORY_SUMMARY_EVERY_ROUNDS = 4
 
+# 用户想「列出/盘点」已有记忆时，不宜只用当前问句做语义检索
+_LIST_MEMORY_HINTS = (
+    "长期记忆",
+    "记忆有哪些",
+    "记住了什么",
+    "关于我的记忆",
+    "你还记得什么",
+    "搜索到的关于我",
+    "你记得我什么",
+)
+
+
+def _wants_list_all_memories(text: str) -> bool:
+    t = (text or "").strip()
+    return any(hint in t for hint in _LIST_MEMORY_HINTS)
+
+
+def _load_memories(store: BaseStore, namespace: tuple[str, ...], query: str, *, limit: int = 5):
+    """语义检索；若是「列出记忆」类问题或语义无结果，则按命名空间列举。"""
+    if _wants_list_all_memories(query):
+        return store.search(namespace, query=None, limit=max(limit, 20))
+
+    hits = store.search(namespace, query=query, limit=limit)
+    if hits:
+        return hits
+    # 兜底：语义没命中时仍尝试拉一批该用户记忆（避免元问题/措辞差异漏召回）
+    return store.search(namespace, query=None, limit=limit)
+
 
 def _filter_messages(messages: list[Any]) -> list[Any]:
     if len(messages) <= SHORT_TERM_KEEP:
@@ -147,7 +175,7 @@ def build_memory_chat_graph_with_backends(
         last_content = _message_content(messages[-1])
         writer({"type": "stage", "stage": "memory", "status": "search"})
 
-        memories = store.search(namespace, query=last_content, limit=5)
+        memories = _load_memories(store, namespace, last_content, limit=5)
         memory_lines = [
             str(item.value.get("data") or "").strip()
             for item in memories
@@ -159,10 +187,15 @@ def build_memory_chat_graph_with_backends(
 
         info = "\n".join(f"- {line}" for line in memory_lines) or "（暂无）"
         system_msg = (
-            "你是一个带有长期记忆的助手。"
-            "下面是与当前用户相关的长期记忆，请在回答时自然参考；"
-            "不要编造未出现在记忆中的个人信息。\n"
-            f"{info}"
+            "你是一个带有长期记忆的助手。\n"
+            "【长期记忆】（跨会话已保存的用户事实，权威来源）：\n"
+            f"{info}\n"
+            "【回答规则】\n"
+            "1. 回答必须优先依据上方【长期记忆】；记忆里已有的身份、偏好、事实，直接使用，禁止说「不知道」「未告知」。\n"
+            "2. 用户说「根据之前的对话/聊天」时，也应把【长期记忆】视为可用依据"
+            "（当前窗口可能是新会话，短期记录里没有不等于你不知道）。\n"
+            "3. 仅当【长期记忆】为「（暂无）」或确实未覆盖该问题时，才可表示不清楚，并可请用户补充。\n"
+            "4. 不要编造未出现在记忆中的个人信息。"
         )
 
         short_term = _to_openai_messages(_filter_messages(messages))
