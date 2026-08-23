@@ -167,8 +167,33 @@ export default function MemoryChatPage() {
       await memoryChat(
         { thread_id: threadId, message: text },
         (event: MemoryChatSseEvent) => {
-          if (event.type === 'memory_hits' && Array.isArray(event.items)) {
-            const tip = `【长期记忆召回】\n${event.items.map((i) => `· ${i}`).join('\n')}`
+          if (event.type === 'profile_hits' && Array.isArray(event.items)) {
+            const tip = `【身份档案】\n${event.items.map((i) => `· ${i}`).join('\n')}`
+            setWindows((prev) =>
+              prev.map((w) => {
+                if (w.thread_id !== threadId) return w
+                const withoutEmptyAssistant = w.messages.filter(
+                  (m) => !(m.id === assistantId && !m.content),
+                )
+                const assistant =
+                  w.messages.find((m) => m.id === assistantId) || {
+                    id: assistantId,
+                    role: 'assistant' as const,
+                    content: '',
+                  }
+                return {
+                  ...w,
+                  status: `身份档案 ${event.items!.length} 条`,
+                  messages: [
+                    ...withoutEmptyAssistant.filter((m) => m.id !== assistantId),
+                    { id: uid(), role: 'system', content: tip },
+                    assistant,
+                  ],
+                }
+              }),
+            )
+          } else if (event.type === 'memory_hits' && Array.isArray(event.items)) {
+            const tip = `【相关记忆召回】\n${event.items.map((i) => `· ${i}`).join('\n')}`
             setWindows((prev) =>
               prev.map((w) => {
                 if (w.thread_id !== threadId) return w
@@ -192,9 +217,12 @@ export default function MemoryChatPage() {
                 }
               }),
             )
+          } else if (event.type === 'profile_updated' && Array.isArray(event.items)) {
+            message.success(`已更新身份档案（${event.items.length} 条）`)
+            patchWindow(threadId, { status: '已更新身份档案' })
           } else if (event.type === 'memory_saved' && event.data) {
-            message.success(`已写入长期记忆：${event.data}`)
-            patchWindow(threadId, { status: '已写入长期记忆' })
+            message.success(`已写入对话记忆：${event.data}`)
+            patchWindow(threadId, { status: '已写入对话记忆' })
           } else if (event.type === 'answer_delta' && event.delta) {
             applyAssistant((prev) => prev + event.delta)
             patchWindow(threadId, { status: '生成中…' })

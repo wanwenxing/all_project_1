@@ -45,9 +45,9 @@ class Settings(BaseSettings):
     rag_default_top_k: int = 2
 
     # DeepSeek / OpenAI-compatible chat API
-    llm_api_key: str = ""
-    llm_base_url: str = "https://api.deepseek.com"
-    llm_model: str = "deepseek-v4-flash"
+    llm_api_key: str = "sk-e5241ee66f054923a20baa4dafd79e44"
+    llm_base_url: str = "https://ai.shebao.net/gatewa"
+    llm_model: str = "zh-dev-deepseek-v4-flash"
     llm_timeout_seconds: float = 60.0
 
     @property

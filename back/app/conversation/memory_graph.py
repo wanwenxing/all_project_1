@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -12,6 +11,18 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
 
+from app.conversation.memory_prompts import (
+    MEMORY_SUMMARIZE_SYSTEM,
+    build_chat_system_message,
+    build_memory_summarize_user,
+)
+from app.conversation.memory_store import (
+    load_identity_profile,
+    load_recent_general_hints,
+    parse_memory_json,
+    save_memory_split,
+    search_general_memories,
+)
 from app.conversation.store_embeddings import get_store_embeddings
 from app.core.ask_cancel import AskCancelled, AskCancelToken
 from app.llm import DeepSeekChatClient
@@ -85,8 +96,8 @@ async def _summarize_and_store_memory(
     transcript: list[dict[str, str]],
     writer: Any,
     cancel: AskCancelToken | None = None,
-) -> str | None:
-    """对近几轮对话做总结，写入长期记忆；无可记内容则返回 None。"""
+) -> dict[str, list[str]] | None:
+    """对近几轮对话做总结：profile 全量合并，general 逐条追加。"""
     if not transcript:
         return None
 
@@ -94,29 +105,37 @@ async def _summarize_and_store_memory(
     if cancel is not None:
         cancel.throw_if_cancelled()
 
+    existing_profile = load_identity_profile(store, namespace)
+    recent_general = load_recent_general_hints(store, namespace)
+    user_prompt = build_memory_summarize_user(
+        existing_profile=existing_profile,
+        transcript=_format_transcript(transcript),
+        recent_general=recent_general or None,
+    )
+
     try:
-        saved_fact = await llm.chat(
-            system=(
-                "你是对话记忆整理助手。根据近几轮对话，提炼需要长期记住的用户相关事实"
-                "（偏好、身份信息、约定、重要结论等）。"
-                "写成简洁中文陈述，可多条，每行一条；不要编号以外的废话。"
-                "若没有值得长期保存的内容，只输出空字符串。"
-            ),
-            user=_format_transcript(transcript),
+        raw = await llm.chat(
+            system=MEMORY_SUMMARIZE_SYSTEM,
+            user=user_prompt,
             temperature=0.1,
         )
     except AskCancelled:
         raise
     except Exception:  # noqa: BLE001
-        saved_fact = ""
+        raw = ""
 
-    saved_fact = (saved_fact or "").strip()
-    if not saved_fact:
+    parsed = parse_memory_json(raw)
+    profile = parsed["profile"]
+    general = parsed["general"]
+    if not profile and not general:
         return None
 
-    store.put(namespace, str(uuid.uuid4()), {"data": saved_fact})
-    writer({"type": "memory_saved", "data": saved_fact})
-    return saved_fact
+    saved = save_memory_split(store, namespace, profile=profile, general=general)
+    if saved["profile"]:
+        writer({"type": "profile_updated", "items": saved["profile"]})
+    for line in saved["general"]:
+        writer({"type": "memory_saved", "data": line, "category": "general"})
+    return saved
 
 
 def build_memory_chat_graph_with_backends(
@@ -147,23 +166,14 @@ def build_memory_chat_graph_with_backends(
         last_content = _message_content(messages[-1])
         writer({"type": "stage", "stage": "memory", "status": "search"})
 
-        memories = store.search(namespace, query=last_content, limit=5)
-        memory_lines = [
-            str(item.value.get("data") or "").strip()
-            for item in memories
-            if item.value and item.value.get("data")
-        ]
-        memory_lines = [line for line in memory_lines if line]
-        if memory_lines:
-            writer({"type": "memory_hits", "items": memory_lines})
+        identity_lines = load_identity_profile(store, namespace)
+        general_lines = search_general_memories(store, namespace, last_content)
+        if identity_lines:
+            writer({"type": "profile_hits", "items": identity_lines})
+        if general_lines:
+            writer({"type": "memory_hits", "items": general_lines})
 
-        info = "\n".join(f"- {line}" for line in memory_lines) or "（暂无）"
-        system_msg = (
-            "你是一个带有长期记忆的助手。"
-            "下面是与当前用户相关的长期记忆，请在回答时自然参考；"
-            "不要编造未出现在记忆中的个人信息。\n"
-            f"{info}"
-        )
+        system_msg = build_chat_system_message(identity_lines, general_lines)
 
         short_term = _to_openai_messages(_filter_messages(messages))
         llm_messages = [{"role": "system", "content": system_msg}, *short_term]
