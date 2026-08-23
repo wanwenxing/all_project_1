@@ -1,15 +1,13 @@
-"""短期 MemorySaver + 长期 InMemoryStore（BGE）的记忆对话图。"""
+"""短期 AsyncSqliteSaver + 长期 SQLite profile / Chroma general 的记忆对话图。"""
 
 from __future__ import annotations
 
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.store.base import BaseStore
-from langgraph.store.memory import InMemoryStore
 
 from app.conversation.memory_prompts import (
     MEMORY_SUMMARIZE_SYSTEM,
@@ -23,7 +21,6 @@ from app.conversation.memory_store import (
     save_memory_split,
     search_general_memories,
 )
-from app.conversation.store_embeddings import get_store_embeddings
 from app.core.ask_cancel import AskCancelled, AskCancelToken
 from app.llm import DeepSeekChatClient
 
@@ -88,11 +85,19 @@ def _to_openai_messages(messages: list[Any]) -> list[dict[str, str]]:
     return result
 
 
+def extract_thread_messages(messages: list[Any]) -> list[dict[str, str]]:
+    """从 checkpoint state 提取可展示的用户/助手消息。"""
+    return [
+        msg
+        for msg in _to_openai_messages(messages)
+        if msg["role"] in {"user", "assistant"}
+    ]
+
+
 async def _summarize_and_store_memory(
     *,
     llm: DeepSeekChatClient,
-    store: BaseStore,
-    namespace: tuple[str, ...],
+    user_id: str,
     transcript: list[dict[str, str]],
     writer: Any,
     cancel: AskCancelToken | None = None,
@@ -105,8 +110,8 @@ async def _summarize_and_store_memory(
     if cancel is not None:
         cancel.throw_if_cancelled()
 
-    existing_profile = load_identity_profile(store, namespace)
-    recent_general = load_recent_general_hints(store, namespace)
+    existing_profile = load_identity_profile(user_id)
+    recent_general = load_recent_general_hints(user_id)
     user_prompt = build_memory_summarize_user(
         existing_profile=existing_profile,
         transcript=_format_transcript(transcript),
@@ -130,7 +135,7 @@ async def _summarize_and_store_memory(
     if not profile and not general:
         return None
 
-    saved = save_memory_split(store, namespace, profile=profile, general=general)
+    saved = save_memory_split(user_id, profile=profile, general=general)
     if saved["profile"]:
         writer({"type": "profile_updated", "items": saved["profile"]})
     for line in saved["general"]:
@@ -141,8 +146,7 @@ async def _summarize_and_store_memory(
 def build_memory_chat_graph_with_backends(
     llm: DeepSeekChatClient,
     *,
-    store: BaseStore,
-    checkpointer: MemorySaver,
+    checkpointer: AsyncSqliteSaver,
     cancel: AskCancelToken | None = None,
 ):
     builder = StateGraph(MessagesState)
@@ -150,15 +154,12 @@ def build_memory_chat_graph_with_backends(
     async def chatbot(
         state: MessagesState,
         config: RunnableConfig,
-        *,
-        store: BaseStore,
     ) -> dict[str, Any]:
         writer = get_stream_writer()
         if cancel is not None:
             cancel.throw_if_cancelled()
 
         user_id = str(config.get("configurable", {}).get("user_id") or "anonymous")
-        namespace = ("memories", user_id)
         messages = list(state.get("messages") or [])
         if not messages:
             return {"messages": []}
@@ -166,8 +167,8 @@ def build_memory_chat_graph_with_backends(
         last_content = _message_content(messages[-1])
         writer({"type": "stage", "stage": "memory", "status": "search"})
 
-        identity_lines = load_identity_profile(store, namespace)
-        general_lines = search_general_memories(store, namespace, last_content)
+        identity_lines = load_identity_profile(user_id)
+        general_lines = search_general_memories(user_id, last_content)
         if identity_lines:
             writer({"type": "profile_hits", "items": identity_lines})
         if general_lines:
@@ -194,7 +195,6 @@ def build_memory_chat_graph_with_backends(
         answer = "".join(chunks).strip()
         writer({"type": "answer_done", "answer": answer})
 
-        # 每满 4 轮（以用户发言次数计）后，总结近 4 轮并写入长期记忆
         user_turns = _count_user_turns(messages)
         if user_turns > 0 and user_turns % MEMORY_SUMMARY_EVERY_ROUNDS == 0:
             history = _to_openai_messages(messages)
@@ -203,8 +203,7 @@ def build_memory_chat_graph_with_backends(
             window = history[-(MEMORY_SUMMARY_EVERY_ROUNDS * 2) :]
             await _summarize_and_store_memory(
                 llm=llm,
-                store=store,
-                namespace=namespace,
+                user_id=user_id,
                 transcript=window,
                 writer=writer,
                 cancel=cancel,
@@ -215,15 +214,4 @@ def build_memory_chat_graph_with_backends(
     builder.add_node("chatbot", chatbot)
     builder.add_edge(START, "chatbot")
     builder.add_edge("chatbot", END)
-    return builder.compile(checkpointer=checkpointer, store=store)
-
-
-def create_shared_memory_backends() -> tuple[InMemoryStore, MemorySaver]:
-    embeddings = get_store_embeddings()
-    store = InMemoryStore(
-        index={
-            "embed": embeddings,
-            "dims": embeddings.dims,
-        }
-    )
-    return store, MemorySaver()
+    return builder.compile(checkpointer=checkpointer)

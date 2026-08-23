@@ -10,7 +10,12 @@ from app.core.ask_cancel import AskCancelToken
 from app.core.ask_errors import build_done_event, build_error_event, classify_ask_exception
 from app.core.deps import get_current_user
 from app.models.user import User
-from app.schemas.chat import ChatMessageRequest, ChatSessionCreate, ChatSessionData
+from app.schemas.chat import (
+    ChatMessageData,
+    ChatMessageRequest,
+    ChatSessionCreate,
+    ChatSessionData,
+)
 from app.schemas.common import ApiResponse, success
 from app.services import memory_chat as memory_chat_service
 
@@ -67,6 +72,18 @@ def delete_chat_session(
     if not ok:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
     return success(None, message="会话已删除")
+
+
+@router.get("/sessions/{thread_id}/messages", response_model=ApiResponse[list[ChatMessageData]])
+async def list_chat_messages(
+    thread_id: str,
+    current_user: User = Depends(get_current_user),
+) -> ApiResponse[list[ChatMessageData]]:
+    messages = await memory_chat_service.get_session_messages(
+        _user_key(current_user),
+        thread_id,
+    )
+    return success([ChatMessageData(**msg) for msg in messages], message="ok")
 
 
 @router.post("")

@@ -13,6 +13,11 @@ class ChatSessionData(BaseModel):
     created_at: datetime
 
 
+class ChatMessageData(BaseModel):
+    role: str
+    content: str
+
+
 class ChatMessageRequest(BaseModel):
     thread_id: str = Field(..., min_length=1, max_length=64)
     message: str = Field(..., min_length=1, max_length=4000)

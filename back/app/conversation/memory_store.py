@@ -1,71 +1,101 @@
-"""长期记忆读写：profile 固定 key 全量更新，general 逐条追加。"""
+"""长期记忆读写：profile 存 SQLite，general 存 Chroma 向量库。"""
 
 from __future__ import annotations
 
 import json
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
-from langgraph.store.base import BaseStore
+from sqlalchemy.orm import Session
 
-PROFILE_KEY = "profile"
+from app.conversation.memory_chroma import get_memory_chroma_store
+from app.db.session import SessionLocal
+from app.models.user_memory_profile import UserMemoryProfile
+from app.rag.embedder import get_embedder
+
 GENERAL_CATEGORY = "general"
 RECENT_GENERAL_HINT_LIMIT = 5
 GENERAL_SEARCH_LIMIT = 5
 
 
-def load_identity_profile(store: BaseStore, namespace: tuple[str, ...]) -> list[str]:
-    item = store.get(namespace, PROFILE_KEY)
-    if not item or not item.value:
+def _parse_user_id(user_id: str) -> int:
+    return int(user_id)
+
+
+def _identity_from_json(raw: str) -> list[str]:
+    try:
+        parsed = json.loads(raw or "[]")
+    except json.JSONDecodeError:
         return []
-    raw = item.value.get("identity") or []
-    if not isinstance(raw, list):
+    if not isinstance(parsed, list):
         return []
-    return [str(line).strip() for line in raw if str(line).strip()]
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
+def load_identity_profile(user_id: str, *, db: Session | None = None) -> list[str]:
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
+        row = session.get(UserMemoryProfile, _parse_user_id(user_id))
+        if row is None:
+            return []
+        return _identity_from_json(row.identity_json)
+    finally:
+        if owns_session:
+            session.close()
 
 
 def load_recent_general_hints(
-    store: BaseStore,
-    namespace: tuple[str, ...],
+    user_id: str,
     *,
     limit: int = RECENT_GENERAL_HINT_LIMIT,
 ) -> list[str]:
-    hits = store.search(
-        namespace,
-        filter={"category": GENERAL_CATEGORY},
-        limit=limit,
+    """读取该用户最近写入的 general，供总结时避免重复输出。"""
+    chroma = get_memory_chroma_store()
+    result = chroma._collection.get(
+        where={"user_id": str(user_id)},
+        include=["documents", "metadatas"],
     )
-    lines: list[str] = []
-    for item in hits:
-        if not item.value:
+    documents = result.get("documents") or []
+    metadatas = result.get("metadatas") or []
+
+    rows: list[tuple[str, str]] = []
+    for index, doc in enumerate(documents):
+        text = str(doc or "").strip()
+        if not text:
             continue
-        text = str(item.value.get("data") or "").strip()
-        if text:
-            lines.append(text)
-    return lines
+        meta = metadatas[index] if index < len(metadatas) else {}
+        created_at = str((meta or {}).get("created_at") or "")
+        rows.append((created_at, text))
+
+    rows.sort(key=lambda item: item[0], reverse=True)
+    return [text for _, text in rows[:limit]]
 
 
 def search_general_memories(
-    store: BaseStore,
-    namespace: tuple[str, ...],
+    user_id: str,
     query: str,
     *,
     limit: int = GENERAL_SEARCH_LIMIT,
 ) -> list[str]:
-    hits = store.search(
-        namespace,
-        query=query,
-        filter={"category": GENERAL_CATEGORY},
-        limit=limit,
+    text = (query or "").strip()
+    if not text:
+        return []
+
+    embedder = get_embedder()
+    query_embedding = embedder.embed_query(text)
+    hits = get_memory_chroma_store().query(
+        query_embedding,
+        n_results=limit,
+        where={"user_id": str(user_id)},
     )
     lines: list[str] = []
-    for item in hits:
-        if not item.value:
-            continue
-        text = str(item.value.get("data") or "").strip()
-        if text:
-            lines.append(text)
+    for hit in hits:
+        content = str(hit.get("content") or "").strip()
+        if content:
+            lines.append(content)
     return lines
 
 
@@ -98,35 +128,58 @@ def parse_memory_json(raw: str) -> dict[str, list[str]]:
 
 
 def save_memory_split(
-    store: BaseStore,
-    namespace: tuple[str, ...],
+    user_id: str,
     *,
     profile: list[str],
     general: list[str],
+    db: Session | None = None,
 ) -> dict[str, Any]:
-    """profile 覆盖固定 key；general 每条追加新 uuid。"""
+    """profile 覆盖 SQLite 一行；general 每条追加到 Chroma。"""
     saved_profile: list[str] = []
     saved_general: list[str] = []
 
-    if profile:
-        store.put(
-            namespace,
-            PROFILE_KEY,
-            {"identity": profile},
-            index=False,
-        )
-        saved_profile = list(profile)
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
+        if profile:
+            uid = _parse_user_id(user_id)
+            row = session.get(UserMemoryProfile, uid)
+            identity_json = json.dumps(profile, ensure_ascii=False)
+            if row is None:
+                session.add(UserMemoryProfile(user_id=uid, identity_json=identity_json))
+            else:
+                row.identity_json = identity_json
+            session.commit()
+            saved_profile = list(profile)
 
-    for text in general:
-        line = text.strip()
-        if not line:
-            continue
-        store.put(
-            namespace,
-            str(uuid.uuid4()),
-            {"category": GENERAL_CATEGORY, "data": line},
-        )
-        saved_general.append(line)
+        if general:
+            embedder = get_embedder()
+            chroma = get_memory_chroma_store()
+            for text in general:
+                line = text.strip()
+                if not line:
+                    continue
+                embedding = embedder.embed_query(line)
+                chroma.upsert(
+                    chroma_ids=[str(uuid.uuid4())],
+                    documents=[line],
+                    embeddings=[embedding],
+                    metadatas=[
+                        {
+                            "user_id": str(user_id),
+                            "category": GENERAL_CATEGORY,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ],
+                )
+                saved_general.append(line)
+    except Exception:
+        if owns_session:
+            session.rollback()
+        raise
+    finally:
+        if owns_session:
+            session.close()
 
     return {"profile": saved_profile, "general": saved_general}
 

@@ -1,6 +1,7 @@
 import {
   createChatSession,
   deleteChatSession,
+  listChatMessages,
   listChatSessions,
   memoryChat,
   type ChatSession,
@@ -49,22 +50,29 @@ export default function MemoryChatPage() {
     setLoading(true)
     try {
       const sessions = await listChatSessions()
-      setWindows((prev) => {
-        const byId = new Map(prev.map((w) => [w.thread_id, w]))
-        return sessions.map((s: ChatSession) => {
-          const existing = byId.get(s.thread_id)
-          return (
-            existing || {
-              thread_id: s.thread_id,
-              title: s.title,
-              messages: [],
-              input: '',
-              sending: false,
-              status: '',
-            }
-          )
+      const nextWindows: WindowState[] = []
+      for (const s of sessions as ChatSession[]) {
+        let messages: ChatMessage[] = []
+        try {
+          const history = await listChatMessages(s.thread_id)
+          messages = history.map((m) => ({
+            id: uid(),
+            role: m.role as ChatMessage['role'],
+            content: m.content,
+          }))
+        } catch {
+          messages = []
+        }
+        nextWindows.push({
+          thread_id: s.thread_id,
+          title: s.title,
+          messages,
+          input: '',
+          sending: false,
+          status: '',
         })
-      })
+      }
+      setWindows(nextWindows)
     } catch {
       // axios 拦截器已提示
     } finally {
@@ -93,7 +101,7 @@ export default function MemoryChatPage() {
               id: uid(),
               role: 'system',
               content:
-                '同一账号下，可在本窗口说「记住…」写入长期记忆；换到其它窗口提问，仍可召回。',
+                '同一账号下，每满 4 轮对话会自动总结并写入长期记忆；换到其它窗口仍可召回身份档案与相关记忆。',
             },
           ],
           input: '',

@@ -12,7 +12,16 @@ from app.core.security import TOKEN_REFRESH_HEADER
 from app.db.base import Base
 from app.db.migrate import run_migrations
 from app.db.session import engine, ensure_data_dir
-from app.models import ask_log, document, document_chunk, eval_models, user  # noqa: F401
+from app.conversation.memory_backends import close_memory_backends, init_memory_backends
+from app.models import (  # noqa: F401
+    ask_log,
+    chat_session,
+    document,
+    document_chunk,
+    eval_models,
+    user,
+    user_memory_profile,
+)
 from app.schemas.common import error
 
 
@@ -30,7 +39,9 @@ async def lifespan(_: FastAPI):
     ensure_data_dir()
     Base.metadata.create_all(bind=engine)
     run_migrations(engine)
+    await init_memory_backends()
     yield
+    await close_memory_backends()
 
 
 app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)

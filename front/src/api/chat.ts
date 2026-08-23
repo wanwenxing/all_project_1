@@ -6,6 +6,11 @@ export interface ChatSession {
   created_at: string
 }
 
+export interface ChatMessage {
+  role: 'user' | 'assistant' | 'system'
+  content: string
+}
+
 export type MemoryChatSseEvent = {
   type: string
   stage?: string
@@ -31,6 +36,10 @@ export function listChatSessions() {
 
 export function deleteChatSession(threadId: string) {
   return http.delete<null>(`/chat/sessions/${threadId}`)
+}
+
+export function listChatMessages(threadId: string) {
+  return http.get<ChatMessage[]>(`/chat/sessions/${threadId}/messages`)
 }
 
 function getApiBaseUrl() {
