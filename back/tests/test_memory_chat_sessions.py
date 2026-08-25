@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from app.main import app
 from app.services.memory_chat import reset_memory_chat_for_tests
 
 
@@ -25,9 +24,8 @@ def _register_and_login(client: TestClient, suffix: str) -> str:
     return token
 
 
-def test_chat_session_crud():
+def test_chat_session_crud(client):
     reset_memory_chat_for_tests()
-    client = TestClient(app)
     token = _register_and_login(client, "s1")
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -40,6 +38,10 @@ def test_chat_session_crud():
     listed = client.get("/api/chat/sessions", headers=headers)
     assert listed.status_code == 200
     assert any(s["thread_id"] == thread_id for s in listed.json()["data"])
+
+    messages = client.get(f"/api/chat/sessions/{thread_id}/messages", headers=headers)
+    assert messages.status_code == 200
+    assert messages.json()["data"] == []
 
     deleted = client.delete(f"/api/chat/sessions/{thread_id}", headers=headers)
     assert deleted.status_code == 200

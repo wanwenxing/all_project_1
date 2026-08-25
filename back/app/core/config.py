@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     port: int = 3000
 
     database_url: str = "sqlite:///./data/app.db"
+    memory_checkpoint_path: str = "./data/langgraph_checkpoints.db"
+    memory_chroma_collection: str = "user_memory_general"
 
     secret_key: str = "change-me-to-a-random-secret-key"
     access_token_expire_minutes: int = 60
@@ -45,10 +47,14 @@ class Settings(BaseSettings):
     rag_default_top_k: int = 2
 
     # DeepSeek / OpenAI-compatible chat API
-    llm_api_key: str = ""
-    llm_base_url: str = "https://api.deepseek.com"
-    llm_model: str = "deepseek-v4-flash"
+    llm_api_key: str = "sk-e5241ee66f054923a20baa4dafd79e44"
+    llm_base_url: str = "https://ai.shebao.net/gatewa"
+    llm_model: str = "zh-dev-deepseek-v4-flash"
     llm_timeout_seconds: float = 60.0
+
+    @property
+    def back_root(self) -> Path:
+        return _BACK_ROOT
 
     @property
     def cors_origin_list(self) -> list[str]:

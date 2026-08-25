@@ -1,6 +1,7 @@
 import {
   createChatSession,
   deleteChatSession,
+  listChatMessages,
   listChatSessions,
   memoryChat,
   type ChatSession,
@@ -49,22 +50,29 @@ export default function MemoryChatPage() {
     setLoading(true)
     try {
       const sessions = await listChatSessions()
-      setWindows((prev) => {
-        const byId = new Map(prev.map((w) => [w.thread_id, w]))
-        return sessions.map((s: ChatSession) => {
-          const existing = byId.get(s.thread_id)
-          return (
-            existing || {
-              thread_id: s.thread_id,
-              title: s.title,
-              messages: [],
-              input: '',
-              sending: false,
-              status: '',
-            }
-          )
+      const nextWindows: WindowState[] = []
+      for (const s of sessions as ChatSession[]) {
+        let messages: ChatMessage[] = []
+        try {
+          const history = await listChatMessages(s.thread_id)
+          messages = history.map((m) => ({
+            id: uid(),
+            role: m.role as ChatMessage['role'],
+            content: m.content,
+          }))
+        } catch {
+          messages = []
+        }
+        nextWindows.push({
+          thread_id: s.thread_id,
+          title: s.title,
+          messages,
+          input: '',
+          sending: false,
+          status: '',
         })
-      })
+      }
+      setWindows(nextWindows)
     } catch {
       // axios 拦截器已提示
     } finally {
@@ -93,7 +101,7 @@ export default function MemoryChatPage() {
               id: uid(),
               role: 'system',
               content:
-                '同一账号下，可在本窗口说「记住…」写入长期记忆；换到其它窗口提问，仍可召回。',
+                '同一账号下，每满 4 轮对话会自动总结并写入长期记忆；换到其它窗口仍可召回身份档案与相关记忆。',
             },
           ],
           input: '',
@@ -167,8 +175,33 @@ export default function MemoryChatPage() {
       await memoryChat(
         { thread_id: threadId, message: text },
         (event: MemoryChatSseEvent) => {
-          if (event.type === 'memory_hits' && Array.isArray(event.items)) {
-            const tip = `【长期记忆召回】\n${event.items.map((i) => `· ${i}`).join('\n')}`
+          if (event.type === 'profile_hits' && Array.isArray(event.items)) {
+            const tip = `【身份档案】\n${event.items.map((i) => `· ${i}`).join('\n')}`
+            setWindows((prev) =>
+              prev.map((w) => {
+                if (w.thread_id !== threadId) return w
+                const withoutEmptyAssistant = w.messages.filter(
+                  (m) => !(m.id === assistantId && !m.content),
+                )
+                const assistant =
+                  w.messages.find((m) => m.id === assistantId) || {
+                    id: assistantId,
+                    role: 'assistant' as const,
+                    content: '',
+                  }
+                return {
+                  ...w,
+                  status: `身份档案 ${event.items!.length} 条`,
+                  messages: [
+                    ...withoutEmptyAssistant.filter((m) => m.id !== assistantId),
+                    { id: uid(), role: 'system', content: tip },
+                    assistant,
+                  ],
+                }
+              }),
+            )
+          } else if (event.type === 'memory_hits' && Array.isArray(event.items)) {
+            const tip = `【相关记忆召回】\n${event.items.map((i) => `· ${i}`).join('\n')}`
             setWindows((prev) =>
               prev.map((w) => {
                 if (w.thread_id !== threadId) return w
@@ -192,9 +225,12 @@ export default function MemoryChatPage() {
                 }
               }),
             )
+          } else if (event.type === 'profile_updated' && Array.isArray(event.items)) {
+            message.success(`已更新身份档案（${event.items.length} 条）`)
+            patchWindow(threadId, { status: '已更新身份档案' })
           } else if (event.type === 'memory_saved' && event.data) {
-            message.success(`已写入长期记忆：${event.data}`)
-            patchWindow(threadId, { status: '已写入长期记忆' })
+            message.success(`已写入对话记忆：${event.data}`)
+            patchWindow(threadId, { status: '已写入对话记忆' })
           } else if (event.type === 'answer_delta' && event.delta) {
             applyAssistant((prev) => prev + event.delta)
             patchWindow(threadId, { status: '生成中…' })
