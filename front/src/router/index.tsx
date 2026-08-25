@@ -1,6 +1,7 @@
 import AuthLayout from '@/layouts/AuthLayout'
 import BasicLayout from '@/layouts/BasicLayout'
 import About from '@/pages/About'
+import Agent from '@/pages/Agent'
 import EvalCasesPage from '@/pages/Eval/Cases'
 import EvalRunsPage from '@/pages/Eval/Runs'
 import Home from '@/pages/Home'
@@ -26,6 +27,10 @@ const router = createBrowserRouter([
       {
         path: 'memory-chat',
         element: <MemoryChat />,
+      },
+      {
+        path: 'agent',
+        element: <Agent />,
       },
       {
         path: 'evals/cases',

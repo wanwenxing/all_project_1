@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     llm_model: str = "zh-dev-deepseek-v4-flash"
     llm_timeout_seconds: float = 60.0
 
+    # MCP 常驻服务（streamable-http）
+    mcp_host: str = "0.0.0.0"
+    mcp_port: int = 3100
+    # Client 连接地址（本机 Agent 默认连 127.0.0.1）
+    mcp_url: str = "http://127.0.0.1:3100/mcp"
+
     @property
     def back_root(self) -> Path:
         return _BACK_ROOT

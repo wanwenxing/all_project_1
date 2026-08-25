@@ -7,6 +7,7 @@ const menuItems = [
   { key: '/', label: '首页' },
   { key: '/knowledge', label: '知识库' },
   { key: '/memory-chat', label: '记忆对话' },
+  { key: '/agent', label: 'Agent' },
   { key: '/evals/cases', label: '评测题库' },
   { key: '/evals/runs', label: '测评任务' },
   { key: '/about', label: '关于' },
